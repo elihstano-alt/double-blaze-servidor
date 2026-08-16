@@ -1198,6 +1198,7 @@ def importar_1000_bestblaze(meta=1000, max_dias=7):
         return {
             "ok": True,
             "meta": meta,
+            "meta_efetiva": meta,
             "max_dias": max_dias,
             "total_inicial": total_inicial,
             "total_banco": total_inicial,
@@ -1295,6 +1296,7 @@ def importar_1000_bestblaze(meta=1000, max_dias=7):
     return {
         "ok": total_banco >= meta,
         "meta": meta,
+        "meta_efetiva": meta,
         "max_dias": max_dias,
         "total_inicial": total_inicial,
         "total_banco": total_banco,
@@ -1682,24 +1684,33 @@ class Handler(BaseHTTPRequestHandler):
             meta = 1000
             max_dias = 7
 
-            try:
-                if "?" in self.path:
-                    query = self.path.split("?", 1)[1]
+            caminho, _, query = self.path.partition("?")
 
-                    for parte in query.split("&"):
-                        if parte.startswith("meta="):
-                            meta = int(parte.split("=", 1)[1])
-                        elif parte.startswith("max_dias="):
-                            max_dias = int(parte.split("=", 1)[1])
-            except Exception:
-                meta = 1000
-                max_dias = 7
+            for parte in query.split("&"):
+                chave, separador, valor = parte.partition("=")
+
+                if not separador:
+                    continue
+
+                if chave == "meta":
+                    try:
+                        meta = int(valor)
+                    except (TypeError, ValueError):
+                        meta = 1000
+
+                elif chave == "max_dias":
+                    try:
+                        max_dias = int(valor)
+                    except (TypeError, ValueError):
+                        max_dias = 7
 
             try:
                 resultado = importar_1000_bestblaze(
                     meta=meta,
                     max_dias=max_dias
                 )
+                resultado["meta_solicitada_na_url"] = meta
+                resultado["max_dias_solicitado_na_url"] = max_dias
                 self.enviar_json(
                     200 if resultado.get("ok") else 206,
                     resultado
@@ -1722,7 +1733,7 @@ class Handler(BaseHTTPRequestHandler):
 
             self.enviar_json(200, {
                 "ok": True,
-                "versao": "V41",
+                "versao": "V42",
                 "fonte_online": fonte_online,
                 "rodadas": len(banco),
                 "vermelhos": sum(
