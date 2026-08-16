@@ -98,7 +98,12 @@ ESTADO = {
     "ws_conectado_epoch": 0.0,
     "ws_ultimo_raw_epoch": 0.0,
     "sinal_recalculado_inicio": False,
-    "sinal_erro_inicio": ""
+    "sinal_erro_inicio": "",
+    "sinal_base_rodada_id": "",
+    "sinal_base_data_hora": "",
+    "sinal_gerado_em": "",
+    "sinal_calculo_ms": None,
+    "sinal_seq": 0
 }
 
 CONFIG_PADRAO = {
@@ -626,10 +631,15 @@ def websocket_tempo_real_saudavel(max_sem_rolling=90.0):
 
 def recalcular_sinal_inicial():
     try:
-        sinal = calcular_sinal()
+        with LOCK:
+            base = ordenar_rodadas_canonicas(
+                list(ESTADO.get("rodadas", []))
+            )
+            ultima = dict(base[-1]) if base else {}
+
+        atualizar_sinal_e_notificar(ultima)
 
         with LOCK:
-            ESTADO["ultimo_sinal"] = sinal
             ESTADO["sinal_recalculado_inicio"] = True
             ESTADO["sinal_erro_inicio"] = ""
 
@@ -1228,14 +1238,43 @@ def enviar_ntfy(sinal):
         return False
 
 
-def atualizar_sinal_e_notificar():
+def atualizar_sinal_e_notificar(rodada_base=None):
+    """
+    Calcula o sinal depois de uma rodada nova e grava exatamente
+    QUAL rodada serviu de base. Não altera o WebSocket.
+    """
+    inicio = time.perf_counter()
     sinal = calcular_sinal()
+    calculo_ms = (time.perf_counter() - inicio) * 1000.0
+
+    rodada_base = rodada_base if isinstance(rodada_base, dict) else {}
+
+    base_id = str(rodada_base.get("id", ""))
+    base_data_hora = str(rodada_base.get("data_hora", ""))
+    gerado_em = agora_brasilia()
+
+    sinal = dict(sinal or {"valido": False})
+    sinal["base_rodada_id"] = base_id
+    sinal["base_data_hora"] = base_data_hora
+    sinal["gerado_em_brasilia"] = gerado_em
+    sinal["calculo_ms"] = round(calculo_ms, 3)
+
     registrar_sinal(sinal)
 
     with LOCK:
-        anterior = ESTADO.get("ultimo_sinal", {"valido": False})
+        anterior = dict(
+            ESTADO.get("ultimo_sinal", {"valido": False})
+        )
+
         ESTADO["ultimo_sinal"] = sinal
-        ESTADO["ultima_atualizacao"] = agora_brasilia()
+        ESTADO["sinal_base_rodada_id"] = base_id
+        ESTADO["sinal_base_data_hora"] = base_data_hora
+        ESTADO["sinal_gerado_em"] = gerado_em
+        ESTADO["sinal_calculo_ms"] = round(calculo_ms, 3)
+        ESTADO["sinal_seq"] = int(
+            ESTADO.get("sinal_seq", 0)
+        ) + 1
+        ESTADO["ultima_atualizacao"] = gerado_em
         salvar_json(BANCO, ESTADO)
 
     virou_novo_sinal = (
@@ -1243,14 +1282,20 @@ def atualizar_sinal_e_notificar():
         and (
             not anterior.get("valido", False)
             or anterior.get("cor") != sinal.get("cor")
-            or anterior.get("data_hora_brasilia") != sinal.get("data_hora_brasilia")
+            or anterior.get("base_rodada_id") != base_id
         )
     )
 
     cfg = carregar_config()
-    geracao_automatica = bool(cfg.get("geracao_automatica", True))
+    geracao_automatica = bool(
+        cfg.get("geracao_automatica", True)
+    )
 
-    if virou_novo_sinal and geracao_automatica and pode_notificar_agora():
+    if (
+        virou_novo_sinal
+        and geracao_automatica
+        and pode_notificar_agora()
+    ):
         if enviar_ntfy(sinal):
             registrar_notificacao_enviada()
 
@@ -1277,7 +1322,7 @@ def adicionar_rodada(rodada):
     if postgres_configurado():
         postgres_salvar_rodadas([rodada])
 
-    atualizar_sinal_e_notificar()
+    atualizar_sinal_e_notificar(rodada)
     return True
 
 
@@ -2732,7 +2777,18 @@ def status_tempo_real():
             ),
             "sinal_erro": str(
                 ESTADO.get("sinal_erro_inicio", "")
-            )
+            ),
+            "sinal_base_rodada_id": str(
+                ESTADO.get("sinal_base_rodada_id", "")
+            ),
+            "sinal_base_data_hora": str(
+                ESTADO.get("sinal_base_data_hora", "")
+            ),
+            "sinal_gerado_em": str(
+                ESTADO.get("sinal_gerado_em", "")
+            ),
+            "sinal_calculo_ms": ESTADO.get("sinal_calculo_ms"),
+            "sinal_seq": int(ESTADO.get("sinal_seq", 0))
         }
 
     saudavel = websocket_tempo_real_saudavel()
@@ -2744,10 +2800,17 @@ def status_tempo_real():
     )
 
     ultimas_live = live[-20:]
+    ultima_live_id = str(
+        (ultimas_live[-1] if ultimas_live else {}).get("id", "")
+    )
+    sinal_sincronizado = bool(
+        ultima_live_id
+        and snapshot["sinal_base_rodada_id"] == ultima_live_id
+    )
 
     return {
         "ok": True,
-        "versao": "V53",
+        "versao": "V53.1",
         "modo": "tempo_real_websocket",
         "ws_online": snapshot["ws_online"],
         "ws_saudavel": saudavel,
@@ -2766,6 +2829,12 @@ def status_tempo_real():
         "sinal_recalculado_inicio": snapshot["sinal_inicio"],
         "sinal_erro_inicio": snapshot["sinal_erro"],
         "sinal_atual": snapshot["sinal"],
+        "sinal_sincronizado_com_ultima_rodada": sinal_sincronizado,
+        "sinal_base_rodada_id": snapshot["sinal_base_rodada_id"],
+        "sinal_base_data_hora": snapshot["sinal_base_data_hora"],
+        "sinal_gerado_em": snapshot["sinal_gerado_em"],
+        "sinal_calculo_ms": snapshot["sinal_calculo_ms"],
+        "sinal_seq": snapshot["sinal_seq"],
         "ultima_rodada_live": (
             ultimas_live[-1] if ultimas_live else None
         ),
@@ -2779,7 +2848,7 @@ def painel_tempo_real_html():
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Double — Tempo Real V53</title>
+<title>Double — Tempo Real V53.1</title>
 <style>
 *{box-sizing:border-box}
 body{font-family:Arial,sans-serif;background:#0d0f12;color:#f1f1f1;margin:0;padding:14px}
@@ -2800,7 +2869,7 @@ h1{font-size:25px;margin:8px 0 14px}
 </style>
 </head>
 <body>
-<h1>Double — Tempo Real V53</h1>
+<h1>Double — Tempo Real V53.1</h1>
 
 <div class="card">
   <div id="health">Carregando...</div>
@@ -2854,15 +2923,27 @@ async function atualizar(){
     document.getElementById('base').textContent=d.total_base+' / '+d.limite_historico;
 
     const s=d.sinal_atual||{};
-    if(s.valido){
+
+    if(!d.sinal_sincronizado_com_ultima_rodada){
+      document.getElementById('signalMain').textContent='ATUALIZANDO SINAL...';
+      document.getElementById('signalDetail').textContent=
+        'Aguardando o cálculo correspondente à última rodada recebida.';
+    }else if(s.valido){
       document.getElementById('signalMain').textContent=nomeCor(s.cor);
       document.getElementById('signalDetail').textContent=
-        'Probabilidade do modelo: '+((Number(s.probabilidade)||0)*100).toFixed(1)+'% | Amostras: '+(s.amostras??'-')+
+        'SINAL PARA A PRÓXIMA RODADA | Base: '+(d.sinal_base_data_hora||'-')+
+        ' | Gerado: '+(d.sinal_gerado_em||'-')+
+        ' | Cálculo: '+(d.sinal_calculo_ms==null?'-':Number(d.sinal_calculo_ms).toFixed(0)+' ms')+
+        ' | Probabilidade do modelo: '+((Number(s.probabilidade)||0)*100).toFixed(1)+'%'+
+        ' | Amostras: '+(s.amostras??'-')+
         ' | Concordância: '+(s.concordancia_modelos??'-')+'/'+(s.total_modelos??'-');
     }else{
       document.getElementById('signalMain').textContent='SEM ENTRADA';
       document.getElementById('signalDetail').textContent=
-        'Os filtros atuais não aprovaram uma entrada. O sistema não inventa sinal.';
+        'ANÁLISE ATUALIZADA PARA A PRÓXIMA RODADA | Base: '+(d.sinal_base_data_hora||'-')+
+        ' | Gerado: '+(d.sinal_gerado_em||'-')+
+        ' | Candidato estatístico: '+nomeCor(s.cor)+
+        ' | filtros de segurança não aprovaram a entrada.';
     }
 
     document.getElementById('quality').textContent=
