@@ -761,4 +761,4 @@ def worker_feed():
         time.sleep(max(5, intervalo))
 
 
-clas
+class Handler(BaseHTTPRequestHandler):
