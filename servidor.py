@@ -861,19 +861,46 @@ def _atributo_html(tag, nome, padrao=""):
     return padrao
 
 
+def _selecionar_valor_select(corpo_select):
+    """
+    Retorna a opção selecionada; se não houver selected, usa a primeira option
+    com value. Isso replica o comportamento normal do navegador.
+    """
+    opcoes = re.findall(
+        r"(?is)<option\b([^>]*)>(.*?)</option>",
+        corpo_select or ""
+    )
+
+    primeira = ""
+
+    for attrs, _texto in opcoes:
+        valor = _atributo_html(attrs, "value", "")
+
+        if primeira == "" and valor != "":
+            primeira = valor
+
+        if re.search(r"(?i)(?:^|\s)selected(?:\s|=|$)", attrs or ""):
+            return valor
+
+    return primeira
+
+
 def detectar_formulario_periodo_bestblaze(html, base_url):
     """
-    Detecta o formulário real de filtro, incluindo campos ocultos/CSRF.
+    Detecta o formulário real e TODOS os controles relevantes:
+    hidden, select, radio/checkbox marcado e botão de envio.
+
+    Isso evita adivinhar o valor de tipoFiltro.
     """
     forms = re.findall(r"(?is)<form\b([^>]*)>(.*?)</form>", html)
 
     for attrs, corpo in forms:
-        inputs = re.findall(r"(?is)<input\b([^>]*)>", corpo)
-
         campos_data = []
-        ocultos = {}
+        defaults = {}
+        nomes_controles = []
 
-        for attrs_input in inputs:
+        # Inputs.
+        for attrs_input in re.findall(r"(?is)<input\b([^>]*)>", corpo):
             tipo = _atributo_html(attrs_input, "type", "text").lower()
             nome = _atributo_html(attrs_input, "name", "")
             valor = _atributo_html(attrs_input, "value", "")
@@ -881,16 +908,77 @@ def detectar_formulario_periodo_bestblaze(html, base_url):
             if not nome:
                 continue
 
+            nomes_controles.append(nome)
+
             if tipo in ("date", "datetime-local"):
                 campos_data.append((nome, tipo))
-            elif tipo == "hidden":
-                ocultos[nome] = valor
+                continue
+
+            if tipo in ("radio", "checkbox"):
+                marcado = bool(
+                    re.search(
+                        r"(?i)(?:^|\s)checked(?:\s|=|$)",
+                        attrs_input or ""
+                    )
+                )
+                if marcado:
+                    defaults[nome] = valor
+                continue
+
+            if tipo in ("hidden", "text", "number"):
+                defaults[nome] = valor
+                continue
+
+            # Submit input: inclui apenas se ele carrega um nome/valor útil.
+            if tipo == "submit" and nome and valor:
+                defaults.setdefault(nome, valor)
+
+        # Selects: preserva o valor que o navegador enviaria.
+        for attrs_select, corpo_select in re.findall(
+            r"(?is)<select\b([^>]*)>(.*?)</select>",
+            corpo
+        ):
+            nome = _atributo_html(attrs_select, "name", "")
+            if not nome:
+                continue
+
+            nomes_controles.append(nome)
+            defaults[nome] = _selecionar_valor_select(corpo_select)
+
+        # Buttons: muitos sites colocam tipoFiltro no botão clicado.
+        botoes = []
+        for attrs_button, texto_button in re.findall(
+            r"(?is)<button\b([^>]*)>(.*?)</button>",
+            corpo
+        ):
+            tipo = _atributo_html(attrs_button, "type", "submit").lower()
+            nome = _atributo_html(attrs_button, "name", "")
+            valor = _atributo_html(attrs_button, "value", "")
+            texto_limpo = re.sub(r"<[^>]+>", " ", texto_button or "")
+            texto_limpo = re.sub(r"\s+", " ", unescape(texto_limpo)).strip()
+
+            if tipo == "submit":
+                botoes.append({
+                    "name": nome,
+                    "value": valor,
+                    "texto": texto_limpo
+                })
 
         if len(campos_data) < 2:
             continue
 
         metodo = _atributo_html(attrs, "method", "GET").upper()
         action = _atributo_html(attrs, "action", base_url)
+
+        # Se tipoFiltro ainda não tiver valor, procura no botão submit.
+        if not str(defaults.get("tipoFiltro", "")).strip():
+            for botao in botoes:
+                if (
+                    botao.get("name") == "tipoFiltro"
+                    and str(botao.get("value", "")).strip()
+                ):
+                    defaults["tipoFiltro"] = botao["value"]
+                    break
 
         return {
             "method": metodo,
@@ -899,8 +987,9 @@ def detectar_formulario_periodo_bestblaze(html, base_url):
             "tipo_inicial": campos_data[0][1],
             "campo_final": campos_data[1][0],
             "tipo_final": campos_data[1][1],
-            "ocultos": ocultos,
-            "nomes_ocultos": sorted(list(ocultos.keys()))
+            "defaults": defaults,
+            "nomes_controles": sorted(set(nomes_controles)),
+            "botoes": botoes
         }
 
     return None
@@ -930,9 +1019,6 @@ def _headers_bestblaze(referer=""):
 
 
 def criar_sessao_bestblaze():
-    """
-    Cria uma sessão HTTP real, preservando cookies entre GET e POST.
-    """
     jar = CookieJar()
     opener = build_opener(HTTPCookieProcessor(jar))
     return opener, jar
@@ -965,10 +1051,8 @@ def abrir_com_sessao_bestblaze(opener, url, data=None, referer=""):
 
 def buscar_periodo_bestblaze(data_inicial, data_final):
     """
-    Fluxo completo:
-    1. GET inicial para obter cookie de sessão e token/campos ocultos.
-    2. Detecta os nomes reais dos campos de data.
-    3. Reenvia o formulário na MESMA sessão.
+    Fluxo de navegador:
+    GET inicial -> cookies/CSRF -> detecta todos os campos -> POST na mesma sessão.
     """
     base_url = "https://bestblaze.com.br/doubleRodadas"
     opener, jar = criar_sessao_bestblaze()
@@ -993,7 +1077,8 @@ def buscar_periodo_bestblaze(data_inicial, data_final):
             return dt.strftime("%Y-%m-%dT%H:%M")
         return dt.strftime("%Y-%m-%d")
 
-    payload = dict(form.get("ocultos", {}))
+    payload = dict(form.get("defaults", {}))
+
     payload[form["campo_inicial"]] = formatar_data(
         data_inicial,
         form["tipo_inicial"]
@@ -1003,7 +1088,16 @@ def buscar_periodo_bestblaze(data_inicial, data_final):
         form["tipo_final"]
     )
 
-    encoded = urlencode(payload).encode("utf-8")
+    # Campos vazios de filtro secundário normalmente devem continuar vazios.
+    # Só removemos chaves None; strings vazias são preservadas como no browser.
+    payload = {
+        str(k): "" if v is None else str(v)
+        for k, v in payload.items()
+        if str(k).strip()
+    }
+
+    encoded_text = urlencode(payload)
+    encoded = encoded_text.encode("utf-8")
 
     if form["method"] == "POST":
         html, status_post = abrir_com_sessao_bestblaze(
@@ -1015,20 +1109,21 @@ def buscar_periodo_bestblaze(data_inicial, data_final):
         url_final = form["action"]
     else:
         separador = "&" if "?" in form["action"] else "?"
-        url_final = form["action"] + separador + encoded.decode("utf-8")
+        url_final = form["action"] + separador + encoded_text
         html, status_post = abrir_com_sessao_bestblaze(
             opener,
             url_final,
             referer=base_url
         )
 
-    cookies = []
-    for cookie in jar:
-        cookies.append({
+    cookies = [
+        {
             "nome": cookie.name,
             "dominio": cookie.domain,
             "seguro": bool(cookie.secure)
-        })
+        }
+        for cookie in jar
+    ]
 
     diagnostico = {
         "status_get": status_get,
@@ -1037,13 +1132,14 @@ def buscar_periodo_bestblaze(data_inicial, data_final):
         "action": form["action"],
         "campo_inicial": form["campo_inicial"],
         "campo_final": form["campo_final"],
-        "campos_ocultos": form.get("nomes_ocultos", []),
+        "tipo_filtro_enviado": payload.get("tipoFiltro", ""),
+        "controles_detectados": form.get("nomes_controles", []),
+        "botoes_detectados": form.get("botoes", []),
         "cookies_recebidos": cookies,
         "url_final": url_final
     }
 
     return html, form, payload, diagnostico
-
 
 def diagnosticar_sessao_periodo_bestblaze():
     """
@@ -1073,7 +1169,10 @@ def diagnosticar_sessao_periodo_bestblaze():
         "tem_texto_total_rodadas": "Total de rodadas" in texto_resposta,
         "amostra_resposta": texto_resposta[:500],
         "sessao": diag,
-        "campos_enviados": sorted(list(payload.keys()))
+        "campos_enviados": sorted(list(payload.keys())),
+        "tipo_filtro_enviado": payload.get("tipoFiltro", ""),
+        "tem_rodadas_no_periodo": "Rodadas no período" in texto_resposta,
+        "tem_total_de_rodadas": "Total de rodadas" in texto_resposta
     }
 
 
@@ -1549,7 +1648,7 @@ class Handler(BaseHTTPRequestHandler):
 
             self.enviar_json(200, {
                 "ok": True,
-                "versao": "V39",
+                "versao": "V40",
                 "fonte_online": fonte_online,
                 "rodadas": len(banco),
                 "vermelhos": sum(
