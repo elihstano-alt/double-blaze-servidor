@@ -786,9 +786,9 @@ def extrair_bestblaze_historico_html(html):
     texto = html_para_texto(html)
 
     token_re = re.compile(
-        r"(?<!\d)(?:0|[1-9]|1[0-4])(?!\d)"
-        r"|"
         r"\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2}"
+        r"|"
+        r"(?<!\d)(?:0|[1-9]|1[0-4])(?!\d)"
     )
 
     tokens = token_re.findall(texto)
@@ -1176,55 +1176,118 @@ def diagnosticar_sessao_periodo_bestblaze():
     }
 
 
-def importar_1000_bestblaze(meta=1000):
+def importar_1000_bestblaze(meta=1000, max_dias=7):
+    """
+    Importa vários dias anteriores até atingir a meta.
+
+    Preserva o fluxo V40 já validado:
+    sessão + cookies + CSRF + formulário + tipoFiltro.
+
+    Cada dia é consultado separadamente para reduzir risco de timeout e
+    permitir diagnóstico preciso por período.
+    """
     meta = max(100, min(int(meta), 5000))
+    max_dias = max(1, min(int(max_dias), 30))
+
     agora = datetime.now(timezone(timedelta(hours=-3)))
+
+    with LOCK:
+        total_inicial = len(ESTADO.get("rodadas", []))
+
+    if total_inicial >= meta:
+        return {
+            "ok": True,
+            "meta": meta,
+            "max_dias": max_dias,
+            "total_inicial": total_inicial,
+            "total_banco": total_inicial,
+            "total_adicionadas_nesta_importacao": 0,
+            "faltam_para_meta": 0,
+            "dias_consultados": [],
+            "mensagem": "Meta já atingida.",
+            "cores": resumo_cores_historico(meta),
+            "sequencias": sequencias_cores(meta)
+        }
 
     total_adicionadas = 0
     dias_consultados = []
-    ultimo_form = None
-    ultimo_payload = None
+    ultima_sessao = None
 
-    for deslocamento in range(1, 8):
+    for deslocamento in range(1, max_dias + 1):
         alvo = agora - timedelta(days=deslocamento)
-        inicio = alvo.replace(hour=0, minute=0, second=0, microsecond=0)
-        fim = alvo.replace(hour=23, minute=59, second=59, microsecond=0)
+        inicio = alvo.replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        fim = alvo.replace(
+            hour=23, minute=59, second=59, microsecond=0
+        )
 
-        html, form, payload, diag_periodo = buscar_periodo_bestblaze(inicio, fim)
-        ultimo_form = form
-        ultimo_payload = payload
-
-        rodadas = extrair_bestblaze_historico_html(html)
-
-        if not rodadas:
-            raise RuntimeError(
-                "Consulta do período retornou HTTP 200, mas sem rodadas. "
-                "Use /diagnostico-periodo para ver a amostra da resposta."
+        try:
+            html, form, payload, diag = buscar_periodo_bestblaze(
+                inicio,
+                fim
             )
+            ultima_sessao = diag
 
-        resultado = adicionar_rodadas_em_lote(rodadas)
-        adicionadas = int(resultado.get("adicionadas", 0))
-        total_adicionadas += adicionadas
+            rodadas = extrair_bestblaze_historico_html(html)
 
-        dias_consultados.append({
-            "data": alvo.strftime("%d/%m/%Y"),
-            "recebidas": len(rodadas),
-            "adicionadas": adicionadas,
-            "duplicadas": int(resultado.get("duplicadas", 0)),
-            "status_http": int(diag_periodo.get("status_envio", 0)),
-            "metodo": str(diag_periodo.get("metodo", "")),
-            "campos_ocultos": list(diag_periodo.get("campos_ocultos", [])),
-            "cookies": [
-                c.get("nome", "")
-                for c in diag_periodo.get("cookies_recebidos", [])
-            ]
-        })
+            if not rodadas:
+                dias_consultados.append({
+                    "data": alvo.strftime("%d/%m/%Y"),
+                    "ok": False,
+                    "recebidas": 0,
+                    "adicionadas": 0,
+                    "duplicadas": 0,
+                    "status_http": int(diag.get("status_envio", 0)),
+                    "tipo_filtro": str(
+                        diag.get("tipo_filtro_enviado", "")
+                    ),
+                    "erro": (
+                        "HTTP 200, mas nenhuma rodada foi reconhecida"
+                    )
+                })
+                continue
 
-        with LOCK:
-            total_banco = len(ESTADO.get("rodadas", []))
+            resultado = adicionar_rodadas_em_lote(rodadas)
 
-        if total_banco >= meta:
-            break
+            adicionadas = int(resultado.get("adicionadas", 0))
+            duplicadas = int(resultado.get("duplicadas", 0))
+            total_adicionadas += adicionadas
+
+            with LOCK:
+                total_banco = len(ESTADO.get("rodadas", []))
+
+            dias_consultados.append({
+                "data": alvo.strftime("%d/%m/%Y"),
+                "ok": True,
+                "recebidas": len(rodadas),
+                "adicionadas": adicionadas,
+                "duplicadas": duplicadas,
+                "brancos_recebidos": sum(
+                    1
+                    for item in rodadas
+                    if isinstance(item, dict)
+                    and item.get("cor") == "W"
+                ),
+                "status_http": int(diag.get("status_envio", 0)),
+                "tipo_filtro": str(
+                    diag.get("tipo_filtro_enviado", "")
+                ),
+                "total_banco_apos_dia": total_banco
+            })
+
+            if total_banco >= meta:
+                break
+
+        except Exception as exc:
+            dias_consultados.append({
+                "data": alvo.strftime("%d/%m/%Y"),
+                "ok": False,
+                "recebidas": 0,
+                "adicionadas": 0,
+                "duplicadas": 0,
+                "erro": str(exc)
+            })
 
     with LOCK:
         total_banco = len(ESTADO.get("rodadas", []))
@@ -1232,11 +1295,13 @@ def importar_1000_bestblaze(meta=1000):
     return {
         "ok": total_banco >= meta,
         "meta": meta,
+        "max_dias": max_dias,
+        "total_inicial": total_inicial,
         "total_banco": total_banco,
         "total_adicionadas_nesta_importacao": total_adicionadas,
+        "faltam_para_meta": max(0, meta - total_banco),
         "dias_consultados": dias_consultados,
-        "formulario_detectado": ultimo_form,
-        "payload_usado": ultimo_payload,
+        "ultima_sessao": ultima_sessao,
         "cores": resumo_cores_historico(meta),
         "sequencias": sequencias_cores(meta)
     }
@@ -1615,17 +1680,26 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path.startswith("/importar-1000"):
             meta = 1000
+            max_dias = 7
+
             try:
                 if "?" in self.path:
                     query = self.path.split("?", 1)[1]
+
                     for parte in query.split("&"):
                         if parte.startswith("meta="):
                             meta = int(parte.split("=", 1)[1])
+                        elif parte.startswith("max_dias="):
+                            max_dias = int(parte.split("=", 1)[1])
             except Exception:
                 meta = 1000
+                max_dias = 7
 
             try:
-                resultado = importar_1000_bestblaze(meta)
+                resultado = importar_1000_bestblaze(
+                    meta=meta,
+                    max_dias=max_dias
+                )
                 self.enviar_json(
                     200 if resultado.get("ok") else 206,
                     resultado
@@ -1648,7 +1722,7 @@ class Handler(BaseHTTPRequestHandler):
 
             self.enviar_json(200, {
                 "ok": True,
-                "versao": "V40",
+                "versao": "V41",
                 "fonte_online": fonte_online,
                 "rodadas": len(banco),
                 "vermelhos": sum(
@@ -1665,6 +1739,39 @@ class Handler(BaseHTTPRequestHandler):
                 ),
                 "ultima_atualizacao": ultima_atualizacao,
                 "modo_fonte": str(cfg.get("modo_fonte", "json"))
+            })
+            return
+
+        if self.path == "/status-1000":
+            with LOCK:
+                banco = list(ESTADO.get("rodadas", []))
+
+            total = len(banco)
+
+            self.enviar_json(200, {
+                "ok": True,
+                "meta": 1000,
+                "total_banco": total,
+                "faltam_para_1000": max(0, 1000 - total),
+                "meta_atingida": total >= 1000,
+                "vermelhos": sum(
+                    1
+                    for item in banco
+                    if isinstance(item, dict)
+                    and item.get("cor") == "R"
+                ),
+                "pretos": sum(
+                    1
+                    for item in banco
+                    if isinstance(item, dict)
+                    and item.get("cor") == "B"
+                ),
+                "brancos": sum(
+                    1
+                    for item in banco
+                    if isinstance(item, dict)
+                    and item.get("cor") == "W"
+                )
             })
             return
 
