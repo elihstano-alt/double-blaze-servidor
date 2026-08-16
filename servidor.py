@@ -4323,5 +4323,166 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/status":
             with LOCK:
                 self.enviar_json(200, {
-               
-Prévia truncada devido ao tamanho do arquivo
+                    "online": True,
+                    "rodadas": len(ESTADO["rodadas"]),
+                    "ultima_atualizacao": ESTADO.get("ultima_atualizacao", ""),
+                    "feed_configurado": bool(
+                        str(carregar_config().get("resultados_url", "")).strip()
+                        or os.getenv("RESULTADOS_URL", "").strip()
+                    ),
+                    "modo_fonte": str(carregar_config().get("modo_fonte", "json")),
+                    "fonte_online": bool(ESTADO.get("fonte_online", False)),
+                    "ultima_rodada_fonte": str(ESTADO.get("ultima_rodada_fonte", ""))
+                })
+            return
+
+        if self.path == "/sinal":
+            self.enviar_json(200, calcular_sinal())
+            return
+
+        if self.path == "/configuracao":
+            self.enviar_json(200, carregar_config())
+            return
+
+        self.enviar_json(404, {"erro": "rota não encontrada"})
+
+    def do_POST(self):
+        if not self.exigir_autorizacao():
+            return
+
+        if self.path == "/importar-historico":
+            try:
+                resultado = importar_historico_bestblaze()
+                self.enviar_json(200, {
+                    "ok": True,
+                    "resultado": resultado,
+                    "cores": resumo_cores_historico(1000),
+                    "sequencias": sequencias_cores(1000)
+                })
+            except Exception as exc:
+                self.enviar_json(500, {
+                    "ok": False,
+                    "erro": str(exc)
+                })
+            return
+
+        if self.path == "/atualizar-agora":
+            novas = buscar_feed()
+            self.enviar_json(200, {
+                "ok": True,
+                "novas_rodadas": int(novas),
+                "data_hora_brasilia": agora_brasilia()
+            })
+            return
+
+        if self.path == "/rodada":
+            obj = self.ler_json()
+            rodada = item_feed_para_rodada(obj)
+            if rodada is None:
+                self.enviar_json(400, {"erro": "rodada inválida"})
+                return
+
+            nova = adicionar_rodada(rodada)
+            self.enviar_json(200, {"ok": True, "nova": nova})
+            return
+
+        if self.path == "/teste-notificacao":
+            sinal_teste = {
+                "valido": True,
+                "cor": "B",
+                "probabilidade": 0.65,
+                "amostras": 100,
+                "configuracao": "teste do servidor 24h",
+                "data_hora_brasilia": agora_brasilia()
+            }
+            enviado = enviar_ntfy(sinal_teste)
+            self.enviar_json(200, {
+                "ok": bool(enviado),
+                "mensagem": "notificação enviada" if enviado else "notificação não configurada ou falhou"
+            })
+            return
+
+        if self.path == "/configuracao":
+            obj = self.ler_json()
+            if not isinstance(obj, dict):
+                self.enviar_json(400, {"erro": "configuração inválida"})
+                return
+
+            cfg = carregar_config()
+            permitidas = {
+                "sinal_minimo",
+                "amostras_minimas",
+                "modo_adaptativo",
+                "limites_testados",
+                "amostras_testadas",
+                "janela_recente",
+                "janela_longa",
+                "resultados_url",
+                "modo_fonte",
+                "intervalo_segundos",
+                "ntfy_server",
+                "ntfy_topic",
+                "geracao_automatica",
+                "intervalo_notificacao_minutos",
+                "concordancia_minima",
+                "estabilidade_minima"
+            }
+
+            for chave, valor in obj.items():
+                if chave in permitidas:
+                    cfg[chave] = valor
+
+            salvar_json(CONFIG, cfg)
+            atualizar_sinal_e_notificar()
+            self.enviar_json(200, {"ok": True, "configuracao": cfg})
+            return
+
+        self.enviar_json(404, {"erro": "rota não encontrada"})
+
+    def log_message(self, format, *args):
+        print("[%s] %s" % (agora_brasilia(), format % args))
+
+
+def main():
+    carregar_estado()
+
+    if postgres_configurado():
+        postgres_inicializar()
+
+    if not CONFIG.exists():
+        salvar_json(CONFIG, CONFIG_PADRAO)
+
+    porta = int(os.getenv("PORT", os.getenv("PORTA", "8787")))
+
+    thread_sinal = threading.Thread(
+        target=recalcular_sinal_inicial,
+        daemon=True
+    )
+    thread_sinal.start()
+
+    thread_analise = threading.Thread(
+        target=worker_analise_sinal,
+        daemon=True
+    )
+    thread_analise.start()
+
+    thread = threading.Thread(
+        target=worker_feed,
+        daemon=True
+    )
+    thread.start()
+
+    thread_ws = threading.Thread(
+        target=worker_websocket_double,
+        daemon=True
+    )
+    thread_ws.start()
+
+    servidor = ThreadingHTTPServer(("0.0.0.0", porta), Handler)
+    print("Servidor 24h iniciado na porta", porta)
+    print("Horário de Brasília:", agora_brasilia())
+    servidor.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
