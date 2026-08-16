@@ -1205,6 +1205,197 @@ def calcular_sinal():
     }
 
 
+
+def calcular_sinal_tempo_real():
+    """
+    Caminho rápido para a próxima rodada AO VIVO.
+
+    Diferença para calcular_sinal():
+    - NÃO executa busca adaptativa walk-forward completa a cada rodada.
+    - Usa os limites já configurados no servidor.
+    - Mantém ensemble, padrão, concordância e estabilidade.
+    - Trabalha no máximo com a janela longa configurada.
+
+    Isso evita bloquear o sinal por dezenas de segundos/minutos.
+    """
+    with LOCK:
+        base_ordenada = ordenar_rodadas_canonicas(
+            list(ESTADO.get("rodadas", []))
+        )
+
+    cfg = carregar_config()
+
+    janela_longa = max(
+        30,
+        min(
+            int(cfg.get("janela_longa", 1000)),
+            LIMITE_HISTORICO
+        )
+    )
+
+    if len(base_ordenada) > janela_longa:
+        base_ordenada = base_ordenada[-janela_longa:]
+
+    data = cores(base_ordenada)
+
+    if len(data) < 30:
+        return {"valido": False}
+
+    probs = probabilidade_ensemble(data, cfg)
+    escolha = melhor_cor(probs)
+    amostras = contar_amostras_ultimo_padrao(data)
+
+    detalhes_concordancia = concordancia_modelos(data, cfg)
+    total_modelos = int(
+        detalhes_concordancia.get("total_modelos", 0)
+    )
+
+    concordancia_minima = min(
+        int(cfg.get("concordancia_minima", 2)),
+        total_modelos
+    ) if total_modelos > 0 else 0
+
+    concordancia_ok = (
+        int(detalhes_concordancia.get("acordos", 0))
+        >= concordancia_minima
+    )
+
+    estabilidade_atual = estabilidade_configuracao_servidor()
+    estabilidade_minima = float(
+        cfg.get("estabilidade_minima", 50.0)
+    )
+    estabilidade_ok = (
+        estabilidade_atual >= estabilidade_minima
+    )
+
+    limite = float(cfg.get("sinal_minimo", 0.60))
+    amostras_minimas = int(
+        cfg.get("amostras_minimas", 20)
+    )
+
+    valido = (
+        probs.get(escolha, 0.0) >= limite
+        and amostras >= amostras_minimas
+        and concordancia_ok
+        and estabilidade_ok
+    )
+
+    return {
+        "valido": bool(valido),
+        "cor": escolha,
+        "probabilidade": float(
+            probs.get(escolha, 0.0)
+        ),
+        "amostras": int(amostras),
+        "configuracao": (
+            "tempo-real %.0f%% / %d amostras"
+            % (limite * 100.0, amostras_minimas)
+        ),
+        "taxa_historica_configuracao": 0.0,
+        "entradas_avaliadas": 0,
+        "concordancia_modelos": int(
+            detalhes_concordancia.get("acordos", 0)
+        ),
+        "total_modelos": total_modelos,
+        "concordancia_minima": concordancia_minima,
+        "estabilidade_atual": float(
+            estabilidade_atual
+        ),
+        "estabilidade_minima": float(
+            estabilidade_minima
+        ),
+        "data_hora_brasilia": agora_brasilia(),
+        "motor": "tempo_real_rapido"
+    }
+
+
+def atualizar_sinal_tempo_real(rodada_base=None):
+    """
+    Atualiza somente o sinal ao vivo usando o caminho rápido.
+    Preserva a mesma estrutura/metadados da V53.2.
+    """
+    inicio = time.perf_counter()
+    sinal = calcular_sinal_tempo_real()
+    calculo_ms = (
+        time.perf_counter() - inicio
+    ) * 1000.0
+
+    rodada_base = (
+        rodada_base
+        if isinstance(rodada_base, dict)
+        else {}
+    )
+
+    base_id = str(
+        rodada_base.get("id", "")
+    )
+    base_data_hora = str(
+        rodada_base.get("data_hora", "")
+    )
+    gerado_em = agora_brasilia()
+
+    sinal = dict(
+        sinal or {"valido": False}
+    )
+    sinal["base_rodada_id"] = base_id
+    sinal["base_data_hora"] = base_data_hora
+    sinal["gerado_em_brasilia"] = gerado_em
+    sinal["calculo_ms"] = round(
+        calculo_ms,
+        3
+    )
+
+    registrar_sinal(sinal)
+
+    with LOCK:
+        anterior = dict(
+            ESTADO.get(
+                "ultimo_sinal",
+                {"valido": False}
+            )
+        )
+
+        ESTADO["ultimo_sinal"] = sinal
+        ESTADO["sinal_base_rodada_id"] = base_id
+        ESTADO["sinal_base_data_hora"] = base_data_hora
+        ESTADO["sinal_gerado_em"] = gerado_em
+        ESTADO["sinal_calculo_ms"] = round(
+            calculo_ms,
+            3
+        )
+        ESTADO["sinal_seq"] = int(
+            ESTADO.get("sinal_seq", 0)
+        ) + 1
+        ESTADO["ultima_atualizacao"] = gerado_em
+        salvar_json(BANCO, ESTADO)
+
+    virou_novo_sinal = (
+        sinal.get("valido", False)
+        and (
+            not anterior.get("valido", False)
+            or anterior.get("cor") != sinal.get("cor")
+            or anterior.get(
+                "base_rodada_id"
+            ) != base_id
+        )
+    )
+
+    cfg = carregar_config()
+
+    if (
+        virou_novo_sinal
+        and bool(
+            cfg.get(
+                "geracao_automatica",
+                True
+            )
+        )
+        and pode_notificar_agora()
+    ):
+        if enviar_ntfy(sinal):
+            registrar_notificacao_enviada()
+
+
 def enviar_ntfy(sinal):
     cfg = carregar_config()
     topico = str(cfg.get("ntfy_topic", "")).strip() or os.getenv("NTFY_TOPIC", "").strip()
@@ -1347,7 +1538,7 @@ def worker_analise_sinal():
             ESTADO["analise_iniciada_em"] = agora_brasilia()
 
         try:
-            atualizar_sinal_e_notificar(rodada_base)
+            atualizar_sinal_tempo_real(rodada_base)
         except Exception as exc:
             with LOCK:
                 ESTADO["sinal_erro_inicio"] = str(exc)
@@ -2892,7 +3083,7 @@ def status_tempo_real():
 
     return {
         "ok": True,
-        "versao": "V53.2",
+        "versao": "V53.3",
         "modo": "tempo_real_websocket",
         "ws_online": snapshot["ws_online"],
         "ws_saudavel": saudavel,
@@ -2934,7 +3125,7 @@ def painel_tempo_real_html():
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Double — Tempo Real V53.2</title>
+<title>Double — Tempo Real V53.3</title>
 <style>
 *{box-sizing:border-box}
 body{font-family:Arial,sans-serif;background:#0d0f12;color:#f1f1f1;margin:0;padding:14px}
@@ -2955,7 +3146,7 @@ h1{font-size:25px;margin:8px 0 14px}
 </style>
 </head>
 <body>
-<h1>Double — Tempo Real V53.2</h1>
+<h1>Double — Tempo Real V53.3</h1>
 
 <div class="card">
   <div id="health">Carregando...</div>
@@ -3013,7 +3204,7 @@ async function atualizar(){
     if(!d.sinal_sincronizado_com_ultima_rodada){
       document.getElementById('signalMain').textContent='ATUALIZANDO SINAL...';
       document.getElementById('signalDetail').textContent=
-        'Cálculo da próxima rodada em segundo plano. A captura WebSocket continua livre para receber novos resultados.';
+        'Cálculo rápido da próxima rodada em segundo plano. A captura WebSocket continua livre para receber novos resultados.';
     }else if(s.valido){
       document.getElementById('signalMain').textContent=nomeCor(s.cor);
       document.getElementById('signalDetail').textContent=
