@@ -2979,6 +2979,10 @@ def status_tempo_real():
 
         snapshot = {
             "ws_online": bool(ESTADO.get("ws_online", False)),
+            "ws_handshake": bool(ESTADO.get("ws_handshake_recebido", False)),
+            "ws_erro": str(ESTADO.get("ws_ultimo_erro", "")),
+            "ws_raw": int(ESTADO.get("ws_mensagens_raw", 0)),
+            "ws_assinaturas": int(ESTADO.get("ws_assinaturas_enviadas", 0)),
             "ultimo_recebido": str(
                 ESTADO.get("ws_ultimo_recebido_brasilia", "")
             ),
@@ -3034,10 +3038,14 @@ def status_tempo_real():
 
     return {
         "ok": True,
-        "versao": "V54",
+        "versao": "V55",
         "modo": "tempo_real_websocket_assincrono",
         "ws_online": snapshot["ws_online"],
         "ws_saudavel": saudavel,
+        "ws_handshake_recebido": snapshot["ws_handshake"],
+        "ws_ultimo_erro": snapshot["ws_erro"],
+        "ws_mensagens_raw": snapshot["ws_raw"],
+        "ws_assinaturas_enviadas": snapshot["ws_assinaturas"],
         "ultimo_recebido": snapshot["ultimo_recebido"],
         "idade_ultimo_resultado_segundos": idade_s,
         "ingestao_ws_ms": snapshot["ingestao_ms"],
@@ -3080,7 +3088,7 @@ def painel_tempo_real_html():
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Double — Tempo Real V54</title>
+<title>Double — Tempo Real V55</title>
 <style>
 *{box-sizing:border-box}
 body{font-family:Arial,sans-serif;background:#0d0f12;color:#f1f1f1;margin:0;padding:14px}
@@ -3101,7 +3109,7 @@ h1{font-size:25px;margin:8px 0 14px}
 </style>
 </head>
 <body>
-<h1>Double — Tempo Real V54</h1>
+<h1>Double — Tempo Real V55</h1>
 
 <div class="card">
   <div id="health">Carregando...</div>
@@ -3144,8 +3152,12 @@ async function atualizar(){
     const d=await r.json();
 
     const healthy=d.ws_online && d.ws_saudavel;
+    const wsLabel = healthy ? 'ONLINE / RECEBENDO' :
+      (d.ws_online ? (d.ws_handshake_recebido ? 'CONECTADO / AGUARDANDO ROLLING' : 'CONECTADO / AGUARDANDO HANDSHAKE') : 'DESCONECTADO');
+    const wsDiag = (!healthy && d.ws_ultimo_erro) ? '<div class="small">Erro: '+esc(d.ws_ultimo_erro)+'</div>' :
+      (!healthy ? '<div class="small">Handshake: '+(d.ws_handshake_recebido?'SIM':'NÃO')+' | Raw: '+(d.ws_mensagens_raw??0)+' | Assinaturas: '+(d.ws_assinaturas_enviadas??0)+'</div>' : '');
     document.getElementById('health').innerHTML =
-      '<b class="'+(healthy?'good':'bad')+'">WebSocket: '+(healthy?'ONLINE / SAUDÁVEL':'ATENÇÃO')+'</b>';
+      '<b class="'+(healthy?'good':'bad')+'">WebSocket: '+wsLabel+'</b>'+wsDiag;
 
     document.getElementById('lastTime').textContent=d.ultimo_recebido||'-';
     document.getElementById('age').textContent=
@@ -3190,13 +3202,13 @@ async function atualizar(){
     }
 
     document.getElementById('quality').textContent=
-      'Rolling: '+d.resultados_rolling_recebidos+
-      ' | Novas: '+d.rodadas_adicionadas_ws+
-      ' | Persistidas: '+d.rodadas_persistidas_ws+
-      ' | Duplicadas: '+d.duplicadas_detectadas+
-      ' | Fora de ordem: '+d.fora_de_ordem_detectadas+
-      ' | Lacunas >60s: '+d.lacunas_maiores_60s+
-      ' | Base: '+d.total_base+'/'+d.limite_historico+
+      'Rolling: '+(d.resultados_rolling_recebidos??0)+
+      ' | Novas: '+(d.rodadas_adicionadas_ws??0)+
+      ' | Persistidas: '+(d.rodadas_persistidas_ws??0)+
+      ' | Duplicadas: '+(d.duplicadas_detectadas??0)+
+      ' | Fora de ordem: '+(d.fora_de_ordem_detectadas??0)+
+      ' | Lacunas >60s: '+(d.lacunas_maiores_60s??0)+
+      ' | Base: '+(d.total_base??0)+'/'+(d.limite_historico??5000)+
       (d.persistencia_erro?' | Erro DB: '+d.persistencia_erro:'');
 
     const rounds=d.ultimas_20_live||[];
@@ -3689,7 +3701,7 @@ class Handler(BaseHTTPRequestHandler):
 
             self.enviar_json(200, {
                 "ok": True,
-                "versao": "V54",
+                "versao": "V55",
                 "fonte_online": fonte_online,
                 "rodadas": len(banco),
                 "vermelhos": sum(
