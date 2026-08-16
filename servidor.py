@@ -848,17 +848,17 @@ def extrair_bestblaze_historico_html(html):
     return rodadas
 
 
-def _atributo_html(tag, nome):
-    """Extrai atributo HTML independentemente da ordem e do tipo de aspas."""
+def _atributo_html(tag, nome, padrao=""):
+    """Extrai atributo HTML; se não existir, retorna o valor padrão informado."""
     nome_esc = re.escape(str(nome))
     padrao_texto = "(?:^|\\s)" + nome_esc + "\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s>]+))"
     achado = re.search(padrao_texto, tag or "", re.IGNORECASE)
     if not achado:
-        return ""
+        return padrao
     for valor in achado.groups():
         if valor is not None:
             return unescape(valor)
-    return ""
+    return padrao
 
 
 def detectar_formulario_periodo_bestblaze(html, base_url):
@@ -1549,7 +1549,7 @@ class Handler(BaseHTTPRequestHandler):
 
             self.enviar_json(200, {
                 "ok": True,
-                "versao": "V38",
+                "versao": "V39",
                 "fonte_online": fonte_online,
                 "rodadas": len(banco),
                 "vermelhos": sum(
