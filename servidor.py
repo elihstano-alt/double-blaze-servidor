@@ -43,6 +43,8 @@ CONFIG = BASE / "configuracao_servidor.json"
 LOCK = threading.Lock()
 INICIO_SERVIDOR_EPOCH = time.time()
 
+LIMITE_HISTORICO = 5000
+
 ESTADO = {
     "rodadas": [],
     "ultima_atualizacao": "",
@@ -302,6 +304,10 @@ def postgres_salvar_rodadas(rodadas):
                     ON CONFLICT DO NOTHING
                 """, linhas)
 
+        limpeza = postgres_limitar_historico(
+            LIMITE_HISTORICO
+        )
+
         with LOCK:
             ESTADO["postgres_online"] = True
             ESTADO["ultimo_erro_postgres"] = ""
@@ -310,7 +316,11 @@ def postgres_salvar_rodadas(rodadas):
         return {
             "ok": True,
             "recebidas": len(rodadas),
-            "gravadas_ou_existentes": len(linhas)
+            "gravadas_ou_existentes": len(linhas),
+            "limite_historico": LIMITE_HISTORICO,
+            "removidas_antigas": int(
+                limpeza.get("removidas", 0)
+            )
         }
 
     except Exception as exc:
@@ -322,6 +332,46 @@ def postgres_salvar_rodadas(rodadas):
             "ok": False,
             "erro": str(exc),
             "recebidas": len(rodadas)
+        }
+
+
+def postgres_limitar_historico(limite=LIMITE_HISTORICO):
+    limite = max(1, int(limite))
+
+    if not postgres_configurado():
+        return {
+            "ok": False,
+            "removidas": 0,
+            "erro": "DATABASE_URL não configurada"
+        }
+
+    try:
+        with conectar_postgres() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    DELETE FROM double_rodadas
+                    WHERE id IN (
+                        SELECT id
+                        FROM double_rodadas
+                        ORDER BY
+                            momento DESC NULLS LAST,
+                            created_at DESC
+                        OFFSET %s
+                    )
+                """, (limite,))
+                removidas = max(0, int(cur.rowcount or 0))
+
+        return {
+            "ok": True,
+            "removidas": removidas,
+            "limite": limite
+        }
+
+    except Exception as exc:
+        return {
+            "ok": False,
+            "removidas": 0,
+            "erro": str(exc)
         }
 
 
@@ -385,6 +435,7 @@ def postgres_status():
         "total_rodadas_postgres": 0,
         "total_rodadas_memoria": 0,
         "ultima_sincronizacao": "",
+        "limite_historico": LIMITE_HISTORICO,
         "erro": ""
     }
 
@@ -455,7 +506,7 @@ def carregar_estado():
 
     if postgres_configurado():
         postgres_inicializar()
-        rodadas_pg = postgres_carregar_rodadas(50000)
+        rodadas_pg = postgres_carregar_rodadas(LIMITE_HISTORICO)
 
         if rodadas_pg:
             with LOCK:
@@ -1072,8 +1123,8 @@ def adicionar_rodada(rodada):
 
         rodadas.append(rodada)
 
-        if len(rodadas) > 50000:
-            del rodadas[:-50000]
+        if len(rodadas) > LIMITE_HISTORICO:
+            del rodadas[:-LIMITE_HISTORICO]
 
         ESTADO["ultima_atualizacao"] = agora_brasilia()
         salvar_json(BANCO, ESTADO)
@@ -1694,8 +1745,8 @@ def adicionar_rodadas_em_lote(rodadas_novas):
 
         banco.sort(key=chave_banco)
 
-        if len(banco) > 50000:
-            del banco[:-50000]
+        if len(banco) > LIMITE_HISTORICO:
+            del banco[:-LIMITE_HISTORICO]
 
         ESTADO["ultima_atualizacao"] = agora_brasilia()
         salvar_json(BANCO, ESTADO)
@@ -2232,7 +2283,7 @@ class Handler(BaseHTTPRequestHandler):
 
             self.enviar_json(200, {
                 "ok": True,
-                "versao": "V45",
+                "versao": "V46",
                 "fonte_online": fonte_online,
                 "rodadas": len(banco),
                 "vermelhos": sum(
@@ -2339,6 +2390,16 @@ class Handler(BaseHTTPRequestHandler):
             self.enviar_json(
                 200,
                 postgres_status()
+            )
+            return
+
+        if self.path == "/limitar-postgres-5000":
+            resultado = postgres_limitar_historico(
+                LIMITE_HISTORICO
+            )
+            self.enviar_json(
+                200 if resultado.get("ok") else 500,
+                resultado
             )
             return
 
