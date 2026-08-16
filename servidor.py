@@ -192,21 +192,28 @@ def html_para_texto(html):
 
 
 def extrair_bestblaze_html(html):
-    """Extrai número e data/hora do histórico público do BestBlaze."""
+    """
+    Extrai as rodadas da página pública /doubleRodadasDia.
+
+    Estrutura observada:
+      DD/MM/AAAA HH:MM:SS
+      NUMERO
+
+    Algumas linhas de horário podem aparecer sem número; nesses casos a rodada
+    é ignorada para evitar associação errada com o resultado seguinte.
+    """
     texto = html_para_texto(html)
 
-    # Na página pública, o resultado aparece associado a uma data/hora completa.
-    # Usamos o formato número -> data/hora para evitar associar o número da
-    # rodada seguinte à data/hora anterior.
     padrao = re.compile(
-        r"(?<!\d)(0|[1-9]|1[0-4])(?!\d)\s+"
         r"(\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2})"
+        r"\s+"
+        r"(0|[1-9]|1[0-4])(?=\s|$)"
     )
 
     rodadas = []
     vistos = set()
 
-    for numero_texto, data_hora in padrao.findall(texto):
+    for data_hora, numero_texto in padrao.findall(texto):
         try:
             numero = int(numero_texto)
             momento = datetime.strptime(data_hora, "%d/%m/%Y %H:%M:%S")
@@ -242,7 +249,7 @@ def buscar_html_publico(url):
     req = Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 Chrome/131.0 Mobile Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Mobile Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.7",
             "Cache-Control": "no-cache"
@@ -693,6 +700,9 @@ def buscar_feed():
     cfg = carregar_config()
     url = str(cfg.get("resultados_url", "")).strip() or os.getenv("RESULTADOS_URL", "").strip()
     modo_fonte = str(cfg.get("modo_fonte", "json")).strip()
+
+    if modo_fonte == "bestblaze_html" and "bestblaze.com.br" in url.lower():
+        url = "https://www.bestblaze.com.br/doubleRodadasDia"
 
     with LOCK:
         ESTADO["ultima_consulta_fonte"] = agora_brasilia()
