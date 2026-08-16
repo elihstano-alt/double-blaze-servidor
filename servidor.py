@@ -19,6 +19,7 @@ NTFY_TOPIC=seu_topico_privado
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
+from urllib.parse import urlencode, urljoin
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import json
@@ -768,44 +769,69 @@ def adicionar_rodada(rodada):
 
 
 
+
 def extrair_bestblaze_historico_html(html):
     """
-    Extrai rodadas históricas usando somente pares confiáveis:
-      DD/MM/AAAA HH:MM:SS -> NUMERO
+    Parser histórico BestBlaze baseado na estrutura pública verificada:
 
-    Entradas sem número associado são ignoradas.
+      NUMERO
+      DD/MM/AAAA HH:MM:SS
+
+    Quando um timestamp aparece sem número imediatamente antes, ele é tratado
+    como branco (W/0).
     """
     texto = html_para_texto(html)
 
-    padrao = re.compile(
-        r"(\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2})"
-        r"\s+"
-        r"(0|[1-9]|1[0-4])(?=\s|$)"
+    timestamp_re = re.compile(
+        r"\b\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2}\b"
     )
 
-    rodadas = []
-    vistos = set()
+    par_re = re.compile(
+        r"(?<!\d)(0|[1-9]|1[0-4])\s+"
+        r"(\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2})"
+    )
 
-    for data_hora, numero_texto in padrao.findall(texto):
+    pares = {}
+    for numero_texto, data_hora in par_re.findall(texto):
         try:
             numero = int(numero_texto)
+        except Exception:
+            continue
+        pares[data_hora] = numero
+
+    todos_horarios = []
+    vistos_horarios = set()
+
+    for data_hora in timestamp_re.findall(texto):
+        if data_hora in vistos_horarios:
+            continue
+        vistos_horarios.add(data_hora)
+        todos_horarios.append(data_hora)
+
+    rodadas = []
+
+    for data_hora in todos_horarios:
+        try:
             momento = datetime.strptime(data_hora, "%d/%m/%Y %H:%M:%S")
         except Exception:
             continue
+
+        if data_hora in pares:
+            numero = int(pares[data_hora])
+            cor = normalizar_cor(numero)
+        else:
+            numero = 0
+            cor = "W"
 
         identificador = "%s-%02d" % (
             momento.strftime("%Y%m%d-%H%M%S"),
             numero
         )
 
-        if identificador in vistos:
-            continue
-
-        vistos.add(identificador)
         rodadas.append({
             "id": identificador,
             "numero": numero,
-            "cor": normalizar_cor(numero),
+            "cor": cor,
             "data_hora": data_hora,
             "origem": "historico"
         })
@@ -817,6 +843,182 @@ def extrair_bestblaze_historico_html(html):
         )
     )
     return rodadas
+
+
+def detectar_formulario_periodo_bestblaze(html, base_url):
+    forms = re.findall(
+        r"(?is)<form\b([^>]*)>(.*?)</form>",
+        html
+    )
+
+    for attrs, corpo in forms:
+        inputs = re.findall(r"(?is)<input\b([^>]*)>", corpo)
+        campos_data = []
+
+        for attrs_input in inputs:
+            tipo_m = re.search(
+                r"(?i)\btype\s*=\s*[\"']?([^\"'\s>]+)",
+                attrs_input
+            )
+            nome_m = re.search(
+                r"(?i)\bname\s*=\s*[\"']?([^\"'\s>]+)",
+                attrs_input
+            )
+
+            if not nome_m:
+                continue
+
+            tipo = tipo_m.group(1).lower() if tipo_m else "text"
+            nome = nome_m.group(1)
+
+            if tipo in ("date", "datetime-local"):
+                campos_data.append((nome, tipo))
+
+        if len(campos_data) < 2:
+            continue
+
+        method_m = re.search(
+            r"(?i)\bmethod\s*=\s*[\"']?([^\"'\s>]+)",
+            attrs
+        )
+        action_m = re.search(
+            r"(?i)\baction\s*=\s*[\"']?([^\"'\s>]+)",
+            attrs
+        )
+
+        metodo = method_m.group(1).upper() if method_m else "GET"
+        action = action_m.group(1) if action_m else base_url
+
+        return {
+            "method": metodo,
+            "action": urljoin(base_url, action),
+            "campo_inicial": campos_data[0][0],
+            "tipo_inicial": campos_data[0][1],
+            "campo_final": campos_data[1][0],
+            "tipo_final": campos_data[1][1]
+        }
+
+    return None
+
+
+def buscar_periodo_bestblaze(data_inicial, data_final):
+    base_url = "https://bestblaze.com.br/doubleRodadas"
+    pagina_inicial = buscar_html_publico(base_url)
+    form = detectar_formulario_periodo_bestblaze(
+        pagina_inicial,
+        base_url
+    )
+
+    if not form:
+        raise RuntimeError(
+            "Não foi possível identificar automaticamente o formulário de período da BestBlaze"
+        )
+
+    def formatar_data(dt, tipo):
+        if tipo == "datetime-local":
+            return dt.strftime("%Y-%m-%dT%H:%M")
+        return dt.strftime("%Y-%m-%d")
+
+    payload = {
+        form["campo_inicial"]: formatar_data(
+            data_inicial,
+            form["tipo_inicial"]
+        ),
+        form["campo_final"]: formatar_data(
+            data_final,
+            form["tipo_final"]
+        )
+    }
+
+    encoded = urlencode(payload)
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Linux; Android 15) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0 Mobile Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.7",
+        "Cache-Control": "no-cache"
+    }
+
+    if form["method"] == "POST":
+        req = Request(
+            form["action"],
+            data=encoded.encode("utf-8"),
+            headers={
+                **headers,
+                "Content-Type": "application/x-www-form-urlencoded"
+            }
+        )
+        html = urlopen(req, timeout=35).read().decode(
+            "utf-8",
+            errors="replace"
+        )
+    else:
+        separador = "&" if "?" in form["action"] else "?"
+        url = form["action"] + separador + encoded
+        req = Request(url, headers=headers)
+        html = urlopen(req, timeout=35).read().decode(
+            "utf-8",
+            errors="replace"
+        )
+
+    return html, form, payload
+
+
+def importar_1000_bestblaze(meta=1000):
+    meta = max(100, min(int(meta), 5000))
+    agora = datetime.now(timezone(timedelta(hours=-3)))
+
+    total_adicionadas = 0
+    dias_consultados = []
+    ultimo_form = None
+    ultimo_payload = None
+
+    for deslocamento in range(1, 8):
+        alvo = agora - timedelta(days=deslocamento)
+        inicio = alvo.replace(hour=0, minute=0, second=0, microsecond=0)
+        fim = alvo.replace(hour=23, minute=59, second=59, microsecond=0)
+
+        html, form, payload = buscar_periodo_bestblaze(inicio, fim)
+        ultimo_form = form
+        ultimo_payload = payload
+
+        rodadas = extrair_bestblaze_historico_html(html)
+
+        resultado = adicionar_rodadas_em_lote(rodadas)
+        adicionadas = int(resultado.get("adicionadas", 0))
+        total_adicionadas += adicionadas
+
+        dias_consultados.append({
+            "data": alvo.strftime("%d/%m/%Y"),
+            "recebidas": len(rodadas),
+            "adicionadas": adicionadas,
+            "duplicadas": int(resultado.get("duplicadas", 0))
+        })
+
+        with LOCK:
+            total_banco = len(ESTADO.get("rodadas", []))
+
+        if total_banco >= meta:
+            break
+
+    with LOCK:
+        total_banco = len(ESTADO.get("rodadas", []))
+
+    return {
+        "ok": total_banco >= meta,
+        "meta": meta,
+        "total_banco": total_banco,
+        "total_adicionadas_nesta_importacao": total_adicionadas,
+        "dias_consultados": dias_consultados,
+        "formulario_detectado": ultimo_form,
+        "payload_usado": ultimo_payload,
+        "cores": resumo_cores_historico(meta),
+        "sequencias": sequencias_cores(meta)
+    }
 
 
 def adicionar_rodadas_em_lote(rodadas_novas):
@@ -1190,6 +1392,30 @@ class Handler(BaseHTTPRequestHandler):
                 })
             return
 
+        if self.path.startswith("/importar-1000"):
+            meta = 1000
+            try:
+                if "?" in self.path:
+                    query = self.path.split("?", 1)[1]
+                    for parte in query.split("&"):
+                        if parte.startswith("meta="):
+                            meta = int(parte.split("=", 1)[1])
+            except Exception:
+                meta = 1000
+
+            try:
+                resultado = importar_1000_bestblaze(meta)
+                self.enviar_json(
+                    200 if resultado.get("ok") else 206,
+                    resultado
+                )
+            except Exception as exc:
+                self.enviar_json(500, {
+                    "ok": False,
+                    "erro": str(exc)
+                })
+            return
+
         if self.path == "/diagnostico-brancos":
             try:
                 html_brancos = buscar_html_publico(
@@ -1215,6 +1441,25 @@ class Handler(BaseHTTPRequestHandler):
                     "ultimo_branco_fonte": (
                         brancos[-1].get("data_hora", "") if brancos else ""
                     )
+                })
+            except Exception as exc:
+                self.enviar_json(500, {
+                    "ok": False,
+                    "erro": str(exc)
+                })
+            return
+
+        if self.path == "/diagnostico-periodo":
+            try:
+                base_url = "https://bestblaze.com.br/doubleRodadas"
+                html = buscar_html_publico(base_url)
+                form = detectar_formulario_periodo_bestblaze(
+                    html,
+                    base_url
+                )
+                self.enviar_json(200, {
+                    "ok": bool(form),
+                    "formulario": form
                 })
             except Exception as exc:
                 self.enviar_json(500, {
