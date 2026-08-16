@@ -50,6 +50,10 @@ INICIO_SERVIDOR_EPOCH = time.time()
 
 LIMITE_HISTORICO = 5000
 
+ANALISE_EVENT = threading.Event()
+ANALISE_PENDENTE_LOCK = threading.Lock()
+ANALISE_PENDENTE_RODADA = None
+
 ESTADO = {
     "rodadas": [],
     "ultima_atualizacao": "",
@@ -103,7 +107,10 @@ ESTADO = {
     "sinal_base_data_hora": "",
     "sinal_gerado_em": "",
     "sinal_calculo_ms": None,
-    "sinal_seq": 0
+    "sinal_seq": 0,
+    "analise_em_andamento": False,
+    "analise_pendente_id": "",
+    "analise_iniciada_em": ""
 }
 
 CONFIG_PADRAO = {
@@ -1300,6 +1307,56 @@ def atualizar_sinal_e_notificar(rodada_base=None):
             registrar_notificacao_enviada()
 
 
+
+def solicitar_recalculo_sinal(rodada_base):
+    global ANALISE_PENDENTE_RODADA
+
+    rodada_base = dict(rodada_base or {})
+
+    with ANALISE_PENDENTE_LOCK:
+        ANALISE_PENDENTE_RODADA = rodada_base
+
+    with LOCK:
+        ESTADO["analise_pendente_id"] = str(
+            rodada_base.get("id", "")
+        )
+
+    ANALISE_EVENT.set()
+
+
+def worker_analise_sinal():
+    global ANALISE_PENDENTE_RODADA
+
+    while True:
+        ANALISE_EVENT.wait()
+        ANALISE_EVENT.clear()
+
+        with ANALISE_PENDENTE_LOCK:
+            rodada_base = (
+                dict(ANALISE_PENDENTE_RODADA)
+                if isinstance(ANALISE_PENDENTE_RODADA, dict)
+                else {}
+            )
+            ANALISE_PENDENTE_RODADA = None
+
+        if not rodada_base:
+            continue
+
+        with LOCK:
+            ESTADO["analise_em_andamento"] = True
+            ESTADO["analise_iniciada_em"] = agora_brasilia()
+
+        try:
+            atualizar_sinal_e_notificar(rodada_base)
+        except Exception as exc:
+            with LOCK:
+                ESTADO["sinal_erro_inicio"] = str(exc)
+        finally:
+            with LOCK:
+                ESTADO["analise_em_andamento"] = False
+
+
+
 def adicionar_rodada(rodada):
     if not rodada:
         return False
@@ -1322,7 +1379,11 @@ def adicionar_rodada(rodada):
     if postgres_configurado():
         postgres_salvar_rodadas([rodada])
 
-    atualizar_sinal_e_notificar(rodada)
+    if str(rodada.get("origem", "")) == "blaze_websocket":
+        solicitar_recalculo_sinal(rodada)
+    else:
+        atualizar_sinal_e_notificar(rodada)
+
     return True
 
 
@@ -2788,7 +2849,16 @@ def status_tempo_real():
                 ESTADO.get("sinal_gerado_em", "")
             ),
             "sinal_calculo_ms": ESTADO.get("sinal_calculo_ms"),
-            "sinal_seq": int(ESTADO.get("sinal_seq", 0))
+            "sinal_seq": int(ESTADO.get("sinal_seq", 0)),
+            "analise_em_andamento": bool(
+                ESTADO.get("analise_em_andamento", False)
+            ),
+            "analise_pendente_id": str(
+                ESTADO.get("analise_pendente_id", "")
+            ),
+            "analise_iniciada_em": str(
+                ESTADO.get("analise_iniciada_em", "")
+            )
         }
 
     saudavel = websocket_tempo_real_saudavel()
@@ -2800,6 +2870,18 @@ def status_tempo_real():
     )
 
     ultimas_live = live[-20:]
+
+    intervalo_ultimas_live_s = None
+    if len(ultimas_live) >= 2:
+        try:
+            intervalo_ultimas_live_s = max(
+                0.0,
+                float(ultimas_live[-1].get("recebido_epoch", 0.0))
+                - float(ultimas_live[-2].get("recebido_epoch", 0.0))
+            )
+        except Exception:
+            intervalo_ultimas_live_s = None
+
     ultima_live_id = str(
         (ultimas_live[-1] if ultimas_live else {}).get("id", "")
     )
@@ -2810,7 +2892,7 @@ def status_tempo_real():
 
     return {
         "ok": True,
-        "versao": "V53.1",
+        "versao": "V53.2",
         "modo": "tempo_real_websocket",
         "ws_online": snapshot["ws_online"],
         "ws_saudavel": saudavel,
@@ -2835,6 +2917,10 @@ def status_tempo_real():
         "sinal_gerado_em": snapshot["sinal_gerado_em"],
         "sinal_calculo_ms": snapshot["sinal_calculo_ms"],
         "sinal_seq": snapshot["sinal_seq"],
+        "analise_em_andamento": snapshot["analise_em_andamento"],
+        "analise_pendente_id": snapshot["analise_pendente_id"],
+        "analise_iniciada_em": snapshot["analise_iniciada_em"],
+        "intervalo_ultimas_live_segundos": intervalo_ultimas_live_s,
         "ultima_rodada_live": (
             ultimas_live[-1] if ultimas_live else None
         ),
@@ -2848,7 +2934,7 @@ def painel_tempo_real_html():
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Double — Tempo Real V53.1</title>
+<title>Double — Tempo Real V53.2</title>
 <style>
 *{box-sizing:border-box}
 body{font-family:Arial,sans-serif;background:#0d0f12;color:#f1f1f1;margin:0;padding:14px}
@@ -2869,7 +2955,7 @@ h1{font-size:25px;margin:8px 0 14px}
 </style>
 </head>
 <body>
-<h1>Double — Tempo Real V53.1</h1>
+<h1>Double — Tempo Real V53.2</h1>
 
 <div class="card">
   <div id="health">Carregando...</div>
@@ -2927,7 +3013,7 @@ async function atualizar(){
     if(!d.sinal_sincronizado_com_ultima_rodada){
       document.getElementById('signalMain').textContent='ATUALIZANDO SINAL...';
       document.getElementById('signalDetail').textContent=
-        'Aguardando o cálculo correspondente à última rodada recebida.';
+        'Cálculo da próxima rodada em segundo plano. A captura WebSocket continua livre para receber novos resultados.';
     }else if(s.valido){
       document.getElementById('signalMain').textContent=nomeCor(s.cor);
       document.getElementById('signalDetail').textContent=
@@ -2946,8 +3032,13 @@ async function atualizar(){
         ' | filtros de segurança não aprovaram a entrada.';
     }
 
+    const intervaloLive = d.intervalo_ultimas_live_segundos==null
+      ? '-'
+      : Number(d.intervalo_ultimas_live_segundos).toFixed(1)+' s';
+
     document.getElementById('quality').textContent=
-      'Rolling recebidos: '+d.resultados_rolling_recebidos+
+      'Intervalo entre as 2 últimas capturas: '+intervaloLive+
+      ' | Rolling recebidos: '+d.resultados_rolling_recebidos+
       ' | Adicionados: '+d.rodadas_adicionadas_ws+
       ' | Duplicadas: '+d.duplicadas_detectadas+
       ' | Fora de ordem: '+d.fora_de_ordem_detectadas+
@@ -3982,6 +4073,12 @@ def main():
         daemon=True
     )
     thread_sinal.start()
+
+    thread_analise = threading.Thread(
+        target=worker_analise_sinal,
+        daemon=True
+    )
+    thread_analise.start()
 
     thread = threading.Thread(
         target=worker_feed,
