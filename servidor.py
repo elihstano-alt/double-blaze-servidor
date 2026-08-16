@@ -762,3 +762,260 @@ def worker_feed():
 
 
 class Handler(BaseHTTPRequestHandler):
+
+    def autorizado(self):
+        return chave_autorizada(self.headers)
+
+    def exigir_autorizacao(self):
+        if self.autorizado():
+            return True
+
+        self.enviar_json(401, {
+            "erro": "não autorizado"
+        })
+        return False
+
+    def enviar_json(self, codigo, obj):
+        corpo = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(codigo)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(corpo)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(corpo)
+
+    def ler_json(self):
+        tamanho = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(tamanho) if tamanho else b"{}"
+        return json.loads(raw.decode("utf-8"))
+
+    def do_GET(self):
+        if not self.exigir_autorizacao():
+            return
+
+        if self.path == "/diagnostico":
+            cfg = carregar_config()
+
+            with LOCK:
+                sinais_registrados = len(ESTADO.get("historico_sinais", []))
+                rodadas = len(ESTADO.get("rodadas", []))
+                fonte_online = bool(ESTADO.get("fonte_online", False))
+                ultima_rodada = str(ESTADO.get("ultima_rodada_fonte", ""))
+                ultima_atualizacao = str(ESTADO.get("ultima_atualizacao", ""))
+
+            fonte_url = (
+                str(cfg.get("resultados_url", "")).strip()
+                or os.getenv("RESULTADOS_URL", "").strip()
+            )
+
+            ntfy_topic = (
+                str(cfg.get("ntfy_topic", "")).strip()
+                or os.getenv("NTFY_TOPIC", "").strip()
+            )
+
+            self.enviar_json(200, {
+                "servidor_online": True,
+                "fonte_configurada": bool(fonte_url),
+                "fonte_online": fonte_online,
+                "notificacao_configurada": bool(ntfy_topic),
+                "geracao_automatica": bool(cfg.get("geracao_automatica", True)),
+                "modo_adaptativo": bool(cfg.get("modo_adaptativo", True)),
+                "autenticacao_ativada": bool(chave_acesso_configurada()),
+                "rodadas": rodadas,
+                "sinais_registrados": sinais_registrados,
+                "tempo_ativo_segundos": int(time.time() - INICIO_SERVIDOR_EPOCH),
+                "ultima_rodada": ultima_rodada,
+                "ultima_atualizacao": ultima_atualizacao
+            })
+            return
+
+        if self.path.startswith("/historico-sinais"):
+            limite = 50
+
+            try:
+                if "?" in self.path:
+                    query = self.path.split("?", 1)[1]
+                    for parte in query.split("&"):
+                        if parte.startswith("limite="):
+                            limite = int(parte.split("=", 1)[1])
+            except Exception:
+                limite = 50
+
+            limite = max(1, min(limite, 500))
+
+            with LOCK:
+                sinais = ESTADO.get("historico_sinais", [])[-limite:]
+
+            self.enviar_json(200, {
+                "sinais": sinais,
+                "quantidade": len(sinais)
+            })
+            return
+
+        if self.path.startswith("/historico"):
+            limite = 1000
+
+            try:
+                if "?" in self.path:
+                    query = self.path.split("?", 1)[1]
+                    for parte in query.split("&"):
+                        if parte.startswith("limite="):
+                            limite = int(parte.split("=", 1)[1])
+            except Exception:
+                limite = 1000
+
+            limite = max(1, min(limite, 5000))
+
+            with LOCK:
+                rodadas = ESTADO["rodadas"][-limite:]
+                self.enviar_json(200, {
+                    "rodadas": rodadas,
+                    "quantidade": len(rodadas),
+                    "ultima_atualizacao": ESTADO.get("ultima_atualizacao", "")
+                })
+            return
+
+        if self.path == "/fonte-status":
+            cfg = carregar_config()
+
+            with LOCK:
+                self.enviar_json(200, {
+                    "online": bool(ESTADO.get("fonte_online", False)),
+                    "configurada": bool(
+                        str(cfg.get("resultados_url", "")).strip()
+                        or os.getenv("RESULTADOS_URL", "").strip()
+                    ),
+                    "modo_fonte": str(cfg.get("modo_fonte", "json")),
+                    "ultima_consulta": str(ESTADO.get("ultima_consulta_fonte", "")),
+                    "ultima_rodada": str(ESTADO.get("ultima_rodada_fonte", "")),
+                    "ultimo_erro": str(ESTADO.get("ultimo_erro_fonte", "")),
+                    "total_importadas": int(ESTADO.get("total_importadas", 0))
+                })
+            return
+
+        if self.path == "/status":
+            with LOCK:
+                self.enviar_json(200, {
+                    "online": True,
+                    "rodadas": len(ESTADO["rodadas"]),
+                    "ultima_atualizacao": ESTADO.get("ultima_atualizacao", ""),
+                    "feed_configurado": bool(
+                        str(carregar_config().get("resultados_url", "")).strip()
+                        or os.getenv("RESULTADOS_URL", "").strip()
+                    ),
+                    "modo_fonte": str(carregar_config().get("modo_fonte", "json")),
+                    "fonte_online": bool(ESTADO.get("fonte_online", False)),
+                    "ultima_rodada_fonte": str(ESTADO.get("ultima_rodada_fonte", ""))
+                })
+            return
+
+        if self.path == "/sinal":
+            self.enviar_json(200, calcular_sinal())
+            return
+
+        if self.path == "/configuracao":
+            self.enviar_json(200, carregar_config())
+            return
+
+        self.enviar_json(404, {"erro": "rota não encontrada"})
+
+    def do_POST(self):
+        if not self.exigir_autorizacao():
+            return
+
+        if self.path == "/atualizar-agora":
+            novas = buscar_feed()
+            self.enviar_json(200, {
+                "ok": True,
+                "novas_rodadas": int(novas),
+                "data_hora_brasilia": agora_brasilia()
+            })
+            return
+
+        if self.path == "/rodada":
+            obj = self.ler_json()
+            rodada = item_feed_para_rodada(obj)
+            if rodada is None:
+                self.enviar_json(400, {"erro": "rodada inválida"})
+                return
+
+            nova = adicionar_rodada(rodada)
+            self.enviar_json(200, {"ok": True, "nova": nova})
+            return
+
+        if self.path == "/teste-notificacao":
+            sinal_teste = {
+                "valido": True,
+                "cor": "B",
+                "probabilidade": 0.65,
+                "amostras": 100,
+                "configuracao": "teste do servidor 24h",
+                "data_hora_brasilia": agora_brasilia()
+            }
+            enviado = enviar_ntfy(sinal_teste)
+            self.enviar_json(200, {
+                "ok": bool(enviado),
+                "mensagem": "notificação enviada" if enviado else "notificação não configurada ou falhou"
+            })
+            return
+
+        if self.path == "/configuracao":
+            obj = self.ler_json()
+            if not isinstance(obj, dict):
+                self.enviar_json(400, {"erro": "configuração inválida"})
+                return
+
+            cfg = carregar_config()
+            permitidas = {
+                "sinal_minimo",
+                "amostras_minimas",
+                "modo_adaptativo",
+                "limites_testados",
+                "amostras_testadas",
+                "janela_recente",
+                "janela_longa",
+                "resultados_url",
+                "modo_fonte",
+                "intervalo_segundos",
+                "ntfy_server",
+                "ntfy_topic",
+                "geracao_automatica",
+                "intervalo_notificacao_minutos",
+                "concordancia_minima",
+                "estabilidade_minima"
+            }
+
+            for chave, valor in obj.items():
+                if chave in permitidas:
+                    cfg[chave] = valor
+
+            salvar_json(CONFIG, cfg)
+            atualizar_sinal_e_notificar()
+            self.enviar_json(200, {"ok": True, "configuracao": cfg})
+            return
+
+        self.enviar_json(404, {"erro": "rota não encontrada"})
+
+    def log_message(self, format, *args):
+        print("[%s] %s" % (agora_brasilia(), format % args))
+
+
+def main():
+    carregar_estado()
+
+    if not CONFIG.exists():
+        salvar_json(CONFIG, CONFIG_PADRAO)
+
+    porta = int(os.getenv("PORT", os.getenv("PORTA", "8787")))
+
+    thread = threading.Thread(target=worker_feed, daemon=True)
+    thread.start()
+
+    servidor = ThreadingHTTPServer(("0.0.0.0", porta), Handler)
+    print("Servidor 24h iniciado na porta", porta)
+    print("Horário de Brasília:", agora_brasilia())
+    servidor.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
