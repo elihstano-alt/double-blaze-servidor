@@ -61,7 +61,12 @@ ESTADO = {
     "ultima_notificacao_epoch": 0.0,
     "postgres_online": False,
     "ultimo_erro_postgres": "",
-    "ultima_sincronizacao_postgres": ""
+    "ultima_sincronizacao_postgres": "",
+    "coletor_ciclos_sem_novas": 0,
+    "coletor_fallback_ultimo": "",
+    "coletor_fallback_adicionadas": 0,
+    "coletor_ultimo_modo": "",
+    "coletor_ultimo_erro": ""
 }
 
 CONFIG_PADRAO = {
@@ -2092,6 +2097,113 @@ def backtest_cor_simples(cor="R", limite=1000):
 
 
 
+def buscar_feed_fallback_bestblaze():
+    """
+    Fallback do coletor ao vivo.
+
+    Usa o mesmo fluxo de sessão/cookies/CSRF/formulário já validado
+    pela importação histórica. Consulta somente uma janela recente e
+    processa apenas as últimas rodadas retornadas.
+
+    Se o formulário do site aceitar apenas 'date', o servidor pode retornar
+    o dia inteiro; nesse caso limitamos localmente às últimas 40 rodadas.
+    """
+    agora = datetime.now(
+        timezone(timedelta(hours=-3))
+    )
+    inicio = agora - timedelta(minutes=20)
+    fim = agora
+
+    html, form, payload, diag = buscar_periodo_bestblaze(
+        inicio,
+        fim
+    )
+
+    rodadas = extrair_bestblaze_historico_html(html)
+
+    # Segurança: nunca reprocessar uma página inteira no loop ao vivo.
+    rodadas = rodadas[-40:]
+
+    adicionadas = 0
+
+    for rodada in rodadas:
+        if adicionar_rodada(rodada):
+            adicionadas += 1
+
+    with LOCK:
+        ESTADO["coletor_fallback_ultimo"] = agora_brasilia()
+        ESTADO["coletor_fallback_adicionadas"] = adicionadas
+        ESTADO["coletor_ultimo_modo"] = "fallback_bestblaze"
+        ESTADO["coletor_ultimo_erro"] = ""
+
+    return {
+        "ok": True,
+        "adicionadas": adicionadas,
+        "reconhecidas": len(rodadas),
+        "status_get": int(diag.get("status_get", 0)),
+        "status_envio": int(diag.get("status_envio", 0)),
+        "tipo_filtro": str(
+            diag.get("tipo_filtro_enviado", "")
+        )
+    }
+
+
+def diagnostico_coletor():
+    cfg = carregar_config()
+
+    with LOCK:
+        estado = {
+            "fonte_online": bool(
+                ESTADO.get("fonte_online", False)
+            ),
+            "ultimo_erro_fonte": str(
+                ESTADO.get("ultimo_erro_fonte", "")
+            ),
+            "ultima_consulta_fonte": str(
+                ESTADO.get("ultima_consulta_fonte", "")
+            ),
+            "ultima_rodada_fonte": str(
+                ESTADO.get("ultima_rodada_fonte", "")
+            ),
+            "ciclos_sem_novas": int(
+                ESTADO.get("coletor_ciclos_sem_novas", 0)
+            ),
+            "fallback_ultimo": str(
+                ESTADO.get("coletor_fallback_ultimo", "")
+            ),
+            "fallback_adicionadas": int(
+                ESTADO.get("coletor_fallback_adicionadas", 0)
+            ),
+            "ultimo_modo": str(
+                ESTADO.get("coletor_ultimo_modo", "")
+            ),
+            "ultimo_erro": str(
+                ESTADO.get("coletor_ultimo_erro", "")
+            ),
+            "total_memoria": len(
+                ESTADO.get("rodadas", [])
+            )
+        }
+
+    return {
+        "ok": True,
+        "intervalo_segundos": int(
+            cfg.get("intervalo_segundos", 10)
+        ),
+        "modo_fonte_configurado": str(
+            cfg.get("modo_fonte", "")
+        ),
+        "resultados_url_configurada": bool(
+            str(cfg.get("resultados_url", "")).strip()
+            or os.getenv("RESULTADOS_URL", "").strip()
+        ),
+        "fallback_apos_ciclos": 3,
+        "fallback_intervalo_minimo_segundos": 60,
+        "estado": estado,
+        "postgres": postgres_status()
+    }
+
+
 def buscar_feed():
     cfg = carregar_config()
     url = str(cfg.get("resultados_url", "")).strip() or os.getenv("RESULTADOS_URL", "").strip()
@@ -2166,16 +2278,88 @@ def buscar_feed():
 
 
 def worker_feed():
+    ciclos_sem_novas = 0
+    ultimo_fallback_epoch = 0.0
+
     while True:
         cfg = carregar_config()
-        intervalo = int(cfg.get("intervalo_segundos", os.getenv("INTERVALO_SEGUNDOS", "10")))
+        intervalo = int(
+            cfg.get(
+                "intervalo_segundos",
+                os.getenv("INTERVALO_SEGUNDOS", "10")
+            )
+        )
+
+        adicionadas = 0
 
         try:
             adicionadas = buscar_feed()
-            if adicionadas:
-                print("Rodadas novas:", adicionadas)
+
+            if adicionadas > 0:
+                ciclos_sem_novas = 0
+
+                with LOCK:
+                    ESTADO["coletor_ciclos_sem_novas"] = 0
+                    ESTADO["coletor_ultimo_modo"] = "fonte_principal"
+                    ESTADO["coletor_ultimo_erro"] = ""
+
+                print(
+                    "Rodadas novas pela fonte principal:",
+                    adicionadas
+                )
+            else:
+                ciclos_sem_novas += 1
+
+                with LOCK:
+                    ESTADO["coletor_ciclos_sem_novas"] = (
+                        ciclos_sem_novas
+                    )
+
         except Exception as exc:
-            print("Erro no monitor:", exc)
+            ciclos_sem_novas += 1
+
+            with LOCK:
+                ESTADO["coletor_ciclos_sem_novas"] = (
+                    ciclos_sem_novas
+                )
+                ESTADO["coletor_ultimo_erro"] = str(exc)
+
+            print("Erro no monitor principal:", exc)
+
+        # Depois de 3 ciclos sem novas rodadas, usa fallback.
+        # Nunca executa o fallback mais de uma vez por minuto.
+        agora_epoch = time.time()
+
+        if (
+            ciclos_sem_novas >= 3
+            and agora_epoch - ultimo_fallback_epoch >= 60
+        ):
+            try:
+                resultado = buscar_feed_fallback_bestblaze()
+                ultimo_fallback_epoch = agora_epoch
+
+                novas_fallback = int(
+                    resultado.get("adicionadas", 0)
+                )
+
+                if novas_fallback > 0:
+                    ciclos_sem_novas = 0
+
+                    with LOCK:
+                        ESTADO["coletor_ciclos_sem_novas"] = 0
+
+                    print(
+                        "Rodadas novas pelo fallback:",
+                        novas_fallback
+                    )
+
+            except Exception as exc:
+                ultimo_fallback_epoch = agora_epoch
+
+                with LOCK:
+                    ESTADO["coletor_ultimo_erro"] = str(exc)
+
+                print("Erro no fallback BestBlaze:", exc)
 
         time.sleep(max(5, intervalo))
 
@@ -2283,7 +2467,7 @@ class Handler(BaseHTTPRequestHandler):
 
             self.enviar_json(200, {
                 "ok": True,
-                "versao": "V46",
+                "versao": "V47",
                 "fonte_online": fonte_online,
                 "rodadas": len(banco),
                 "vermelhos": sum(
@@ -2384,6 +2568,27 @@ class Handler(BaseHTTPRequestHandler):
                     "ok": False,
                     "erro": str(exc)
                 })
+            return
+
+        if self.path == "/diagnostico-coletor":
+            self.enviar_json(
+                200,
+                diagnostico_coletor()
+            )
+            return
+
+        if self.path == "/coletar-agora":
+            try:
+                resultado = buscar_feed_fallback_bestblaze()
+                self.enviar_json(200, resultado)
+            except Exception as exc:
+                self.enviar_json(
+                    500,
+                    {
+                        "ok": False,
+                        "erro": str(exc)
+                    }
+                )
             return
 
         if self.path == "/status-postgres":
