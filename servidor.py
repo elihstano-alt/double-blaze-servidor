@@ -804,7 +804,7 @@ def importar_historico_bestblaze(url=None):
     Se url não for informada, usa a página pública de histórico.
     """
     if not url:
-        url = "https://www.bestblaze.com.br/doubleRodadas"
+        url = "https://bestblaze.com.br/doubleRodadas"
 
     html = buscar_html_publico(url)
     rodadas = extrair_bestblaze_historico_html(html)
