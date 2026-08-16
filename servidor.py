@@ -1428,6 +1428,184 @@ def importar_historico_bestblaze(url=None):
     return resultado
 
 
+
+def _cores_recentes(limite=1000):
+    limite = max(1, min(int(limite), 5000))
+    with LOCK:
+        bloco = list(ESTADO.get("rodadas", []))[-limite:]
+    return [
+        str(item.get("cor", ""))
+        for item in bloco
+        if isinstance(item, dict)
+        and str(item.get("cor", "")) in ("R", "B", "W")
+    ]
+
+
+def analise_janelas():
+    resultado = {}
+    for janela in (10, 20, 50, 100, 500, 1000):
+        cores = _cores_recentes(janela)
+        total = len(cores)
+        cont = {c: cores.count(c) for c in ("R", "B", "W")}
+        resultado[str(janela)] = {
+            "total": total,
+            "R": {"qtd": cont["R"], "pct": (100.0*cont["R"]/total) if total else 0.0},
+            "B": {"qtd": cont["B"], "pct": (100.0*cont["B"]/total) if total else 0.0},
+            "W": {"qtd": cont["W"], "pct": (100.0*cont["W"]/total) if total else 0.0},
+        }
+    return resultado
+
+
+def analise_transicoes(limite=1000):
+    cores = _cores_recentes(limite)
+    matriz = {a: {b: 0 for b in ("R","B","W")} for a in ("R","B","W")}
+    for a, b in zip(cores, cores[1:]):
+        matriz[a][b] += 1
+    probs = {}
+    for a in ("R","B","W"):
+        total = sum(matriz[a].values())
+        probs[a] = {
+            b: {"qtd": matriz[a][b], "pct": (100.0*matriz[a][b]/total) if total else 0.0}
+            for b in ("R","B","W")
+        }
+    return {"total_cores": len(cores), "matriz": matriz, "probabilidades": probs}
+
+
+def analise_padroes(limite=1000, tamanho=3, top=20):
+    tamanho = max(2, min(int(tamanho), 5))
+    top = max(1, min(int(top), 100))
+    cores = _cores_recentes(limite)
+    contagem = {}
+    for i in range(max(0, len(cores)-tamanho+1)):
+        p = "".join(cores[i:i+tamanho])
+        contagem[p] = contagem.get(p, 0) + 1
+    total = sum(contagem.values())
+    itens = sorted(contagem.items(), key=lambda kv: (-kv[1], kv[0]))[:top]
+    return {
+        "tamanho": tamanho,
+        "total_padroes": total,
+        "top": [
+            {"padrao": p, "qtd": q, "pct": (100.0*q/total) if total else 0.0}
+            for p, q in itens
+        ]
+    }
+
+
+def analise_brancos(limite=1000):
+    cores = _cores_recentes(limite)
+    indices = [i for i, c in enumerate(cores) if c == "W"]
+    intervalos = [max(0, b-a-1) for a, b in zip(indices, indices[1:])]
+    desde_ultimo = (len(cores)-1-indices[-1]) if indices else len(cores)
+    return {
+        "total_cores": len(cores),
+        "brancos": len(indices),
+        "media_intervalo": (sum(intervalos)/len(intervalos)) if intervalos else 0.0,
+        "menor_intervalo": min(intervalos) if intervalos else 0,
+        "maior_intervalo": max(intervalos) if intervalos else 0,
+        "rodadas_desde_ultimo_branco": desde_ultimo,
+        "ultimos_intervalos": intervalos[-100:]
+    }
+
+
+def analise_sequencias_detalhada(limite=1000):
+    cores = _cores_recentes(limite)
+    maiores = {"R":0,"B":0,"W":0}
+    if not cores:
+        return {"total_cores":0,"maiores":maiores,"sequencia_atual":{"cor":"","tamanho":0},"alternancias":0,"taxa_alternancia_pct":0.0}
+    atual = cores[0]
+    tam = 0
+    alt = 0
+    ant = None
+    for c in cores:
+        if ant is not None and c != ant:
+            alt += 1
+        ant = c
+        if c == atual:
+            tam += 1
+        else:
+            maiores[atual] = max(maiores[atual], tam)
+            atual, tam = c, 1
+    maiores[atual] = max(maiores[atual], tam)
+    fim = cores[-1]
+    fim_tam = 0
+    for c in reversed(cores):
+        if c == fim:
+            fim_tam += 1
+        else:
+            break
+    return {
+        "total_cores": len(cores),
+        "maiores": maiores,
+        "sequencia_atual": {"cor": fim, "tamanho": fim_tam},
+        "alternancias": alt,
+        "taxa_alternancia_pct": (100.0*alt/(len(cores)-1)) if len(cores)>1 else 0.0
+    }
+
+
+def backtest_regra_transicao(limite=1000, origem="R", apostar="B"):
+    origem = str(origem).upper()
+    apostar = str(apostar).upper()
+    if origem not in ("R","B","W") or apostar not in ("R","B","W"):
+        raise ValueError("cor inválida")
+    cores = _cores_recentes(limite)
+    entradas=acertos=erros=seq_a=seq_e=max_a=max_e=0
+    saldo=pico=dd=0.0
+    ganho = 13.0 if apostar == "W" else 1.0
+    for i in range(len(cores)-1):
+        if cores[i] != origem:
+            continue
+        entradas += 1
+        if cores[i+1] == apostar:
+            acertos += 1; seq_a += 1; seq_e = 0; max_a = max(max_a, seq_a); saldo += ganho
+        else:
+            erros += 1; seq_e += 1; seq_a = 0; max_e = max(max_e, seq_e); saldo -= 1.0
+        pico = max(pico, saldo)
+        dd = max(dd, pico-saldo)
+    return {
+        "regra":{"quando_aparecer":origem,"apostar_na_proxima":apostar},
+        "entradas":entradas,"acertos":acertos,"erros":erros,
+        "taxa_acerto_pct":(100.0*acertos/entradas) if entradas else 0.0,
+        "maior_sequencia_acertos":max_a,"maior_sequencia_erros":max_e,
+        "saldo_simulado_unidades":saldo,"drawdown_max_unidades":dd
+    }
+
+
+def backtest_padroes(limite=1000, padrao="RB", apostar="R"):
+    padrao = str(padrao).upper().strip()
+    apostar = str(apostar).upper().strip()
+    if not 1 <= len(padrao) <= 5 or any(c not in ("R","B","W") for c in padrao):
+        raise ValueError("padrao inválido")
+    if apostar not in ("R","B","W"):
+        raise ValueError("cor inválida")
+    cores = _cores_recentes(limite)
+    n = len(padrao)
+    entradas=acertos=erros=0
+    for i in range(len(cores)-n):
+        if "".join(cores[i:i+n]) == padrao:
+            entradas += 1
+            if cores[i+n] == apostar: acertos += 1
+            else: erros += 1
+    return {
+        "padrao":padrao,"apostar_na_proxima":apostar,
+        "entradas":entradas,"acertos":acertos,"erros":erros,
+        "taxa_acerto_pct":(100.0*acertos/entradas) if entradas else 0.0
+    }
+
+
+def painel_analise(limite=1000):
+    return {
+        "limite": min(max(1,int(limite)),5000),
+        "janelas": analise_janelas(),
+        "sequencias": analise_sequencias_detalhada(limite),
+        "transicoes": analise_transicoes(limite),
+        "brancos": analise_brancos(limite),
+        "padroes_2": analise_padroes(limite,2,10),
+        "padroes_3": analise_padroes(limite,3,10),
+        "padroes_4": analise_padroes(limite,4,10),
+        "padroes_5": analise_padroes(limite,5,10)
+    }
+
+
 def resumo_cores_historico(limite=1000):
     """
     Estatísticas focadas em cores; números ficam apenas como metadado.
@@ -1733,7 +1911,7 @@ class Handler(BaseHTTPRequestHandler):
 
             self.enviar_json(200, {
                 "ok": True,
-                "versao": "V42",
+                "versao": "V43",
                 "fonte_online": fonte_online,
                 "rodadas": len(banco),
                 "vermelhos": sum(
@@ -1834,6 +2012,88 @@ class Handler(BaseHTTPRequestHandler):
                     "ok": False,
                     "erro": str(exc)
                 })
+            return
+
+        if self.path.startswith("/painel-analise"):
+            limite = 1000
+            if "?" in self.path:
+                for parte in self.path.split("?",1)[1].split("&"):
+                    if parte.startswith("limite="):
+                        try: limite = int(parte.split("=",1)[1])
+                        except Exception: pass
+            self.enviar_json(200, painel_analise(limite))
+            return
+
+        if self.path == "/analise-janelas":
+            self.enviar_json(200, analise_janelas())
+            return
+
+        if self.path.startswith("/analise-transicoes"):
+            limite = 1000
+            if "?" in self.path:
+                for parte in self.path.split("?",1)[1].split("&"):
+                    if parte.startswith("limite="):
+                        try: limite = int(parte.split("=",1)[1])
+                        except Exception: pass
+            self.enviar_json(200, analise_transicoes(limite))
+            return
+
+        if self.path.startswith("/analise-brancos"):
+            limite = 1000
+            if "?" in self.path:
+                for parte in self.path.split("?",1)[1].split("&"):
+                    if parte.startswith("limite="):
+                        try: limite = int(parte.split("=",1)[1])
+                        except Exception: pass
+            self.enviar_json(200, analise_brancos(limite))
+            return
+
+        if self.path.startswith("/analise-padroes"):
+            limite, tamanho, top = 1000, 3, 20
+            if "?" in self.path:
+                for parte in self.path.split("?",1)[1].split("&"):
+                    chave, sep, valor = parte.partition("=")
+                    if not sep: continue
+                    try:
+                        if chave == "limite": limite = int(valor)
+                        elif chave == "tamanho": tamanho = int(valor)
+                        elif chave == "top": top = int(valor)
+                    except Exception: pass
+            self.enviar_json(200, analise_padroes(limite,tamanho,top))
+            return
+
+        if self.path.startswith("/backtest-transicao"):
+            limite, origem, apostar = 1000, "R", "B"
+            if "?" in self.path:
+                for parte in self.path.split("?",1)[1].split("&"):
+                    chave, sep, valor = parte.partition("=")
+                    if not sep: continue
+                    if chave == "origem": origem = valor.upper()
+                    elif chave == "apostar": apostar = valor.upper()
+                    elif chave == "limite":
+                        try: limite = int(valor)
+                        except Exception: pass
+            try:
+                self.enviar_json(200, backtest_regra_transicao(limite,origem,apostar))
+            except Exception as exc:
+                self.enviar_json(400, {"erro":str(exc)})
+            return
+
+        if self.path.startswith("/backtest-padrao"):
+            limite, padrao, apostar = 1000, "RB", "R"
+            if "?" in self.path:
+                for parte in self.path.split("?",1)[1].split("&"):
+                    chave, sep, valor = parte.partition("=")
+                    if not sep: continue
+                    if chave == "padrao": padrao = valor.upper()
+                    elif chave == "apostar": apostar = valor.upper()
+                    elif chave == "limite":
+                        try: limite = int(valor)
+                        except Exception: pass
+            try:
+                self.enviar_json(200, backtest_padroes(limite,padrao,apostar))
+            except Exception as exc:
+                self.enviar_json(400, {"erro":str(exc)})
             return
 
         if self.path.startswith("/analise-cores"):
