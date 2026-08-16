@@ -20,12 +20,12 @@
   ],
   "janela_recente": 100,
   "janela_longa": 1000,
-  "resultados_url": "",
+  "resultados_url": "https://www.bestblaze.com.br/doubleRodadas",
   "intervalo_segundos": 10,
   "ntfy_server": "https://ntfy.sh",
   "ntfy_topic": "",
   "geracao_automatica": true,
-  "modo_fonte": "json",
+  "modo_fonte": "bestblaze_html",
   "concordancia_minima": 2,
   "estabilidade_minima": 50.0
 }
