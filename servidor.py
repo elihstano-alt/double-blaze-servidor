@@ -193,34 +193,24 @@ def html_para_texto(html):
 
 def extrair_bestblaze_html(html):
     """
-    Extrai rodadas da página pública BestBlaze /doubleRodadasDia.
-
-    Formato atual observado:
-      DD/MM/AAAA HH:MM:SS
-      NUMERO
-
-    Se houver horário sem número logo depois, a entrada é ignorada.
+    Extrai pares numero + data/hora do histórico público do BestBlaze.
+    O parser não depende de classes CSS específicas; usa o conteúdo textual.
     """
     texto = html_para_texto(html)
 
+    # Número do Double seguido de data/hora.
     padrao = re.compile(
+        r"(?<!\d)(0|[1-9]|1[0-4])\s+"
         r"(\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2})"
-        r"\s+"
-        r"(0|[1-9]|1[0-4])(?=\s|$)"
     )
 
     rodadas = []
     vistos = set()
 
-    for data_hora, numero_texto in padrao.findall(texto):
-        try:
-            numero = int(numero_texto)
-            momento = datetime.strptime(data_hora, "%d/%m/%Y %H:%M:%S")
-        except Exception:
-            continue
-
+    for numero_texto, data_hora in padrao.findall(texto):
+        numero = int(numero_texto)
         identificador = "%s-%02d" % (
-            momento.strftime("%Y%m%d-%H%M%S"),
+            data_hora.replace("/", "").replace(" ", "-").replace(":", ""),
             numero
         )
 
@@ -231,10 +221,10 @@ def extrair_bestblaze_html(html):
         rodadas.append({
             "id": identificador,
             "numero": numero,
-            "cor": normalizar_cor(numero),
             "data_hora": data_hora
         })
 
+    # Ordena cronologicamente para preservar sequência.
     def chave(item):
         try:
             return datetime.strptime(item["data_hora"], "%d/%m/%Y %H:%M:%S")
@@ -244,46 +234,16 @@ def extrair_bestblaze_html(html):
     rodadas.sort(key=chave)
     return rodadas
 
+
 def buscar_html_publico(url):
-    urls = [url]
-
-    # Fallback entre www e sem www.
-    if "://www.bestblaze.com.br/" in url:
-        urls.append(url.replace("://www.bestblaze.com.br/", "://bestblaze.com.br/"))
-    elif "://bestblaze.com.br/" in url:
-        urls.append(url.replace("://bestblaze.com.br/", "://www.bestblaze.com.br/"))
-
-    ultimo_erro = None
-
-    for tentativa in urls:
-        try:
-            req = Request(
-                tentativa,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Mobile Safari/537.36",
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.7",
-                    "Cache-Control": "no-cache",
-                    "Pragma": "no-cache"
-                }
-            )
-            resposta = urlopen(req, timeout=25)
-            status = getattr(resposta, "status", 200)
-
-            if status < 200 or status >= 300:
-                raise RuntimeError("HTTP %s ao consultar BestBlaze" % status)
-
-            corpo = resposta.read().decode("utf-8", errors="replace")
-
-            if not corpo.strip():
-                raise RuntimeError("BestBlaze respondeu conteúdo vazio")
-
-            return corpo
-
-        except Exception as exc:
-            ultimo_erro = exc
-
-    raise RuntimeError("Falha ao consultar BestBlaze: %s" % ultimo_erro)
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 DoubleBlazeIA/1.0",
+            "Accept": "text/html,application/xhtml+xml"
+        }
+    )
+    return urlopen(req, timeout=20).read().decode("utf-8", errors="replace")
 
 def extrair_lista_feed(obj):
     if isinstance(obj, list):
@@ -724,6 +684,256 @@ def adicionar_rodada(rodada):
     return True
 
 
+
+def extrair_bestblaze_historico_html(html):
+    """
+    Extrai rodadas históricas usando somente pares confiáveis:
+      DD/MM/AAAA HH:MM:SS -> NUMERO
+
+    Entradas sem número associado são ignoradas.
+    """
+    texto = html_para_texto(html)
+
+    padrao = re.compile(
+        r"(\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2})"
+        r"\s+"
+        r"(0|[1-9]|1[0-4])(?=\s|$)"
+    )
+
+    rodadas = []
+    vistos = set()
+
+    for data_hora, numero_texto in padrao.findall(texto):
+        try:
+            numero = int(numero_texto)
+            momento = datetime.strptime(data_hora, "%d/%m/%Y %H:%M:%S")
+        except Exception:
+            continue
+
+        identificador = "%s-%02d" % (
+            momento.strftime("%Y%m%d-%H%M%S"),
+            numero
+        )
+
+        if identificador in vistos:
+            continue
+
+        vistos.add(identificador)
+        rodadas.append({
+            "id": identificador,
+            "numero": numero,
+            "cor": normalizar_cor(numero),
+            "data_hora": data_hora,
+            "origem": "historico"
+        })
+
+    rodadas.sort(
+        key=lambda item: datetime.strptime(
+            item["data_hora"],
+            "%d/%m/%Y %H:%M:%S"
+        )
+    )
+    return rodadas
+
+
+def adicionar_rodadas_em_lote(rodadas_novas):
+    """
+    Importação em lote sem disparar análise/notificação a cada registro.
+    Ao final, recalcula o sinal uma única vez.
+    """
+    if not isinstance(rodadas_novas, list):
+        return {
+            "recebidas": 0,
+            "adicionadas": 0,
+            "duplicadas": 0
+        }
+
+    adicionadas = 0
+    duplicadas = 0
+
+    with LOCK:
+        existentes = set(
+            str(item.get("id", ""))
+            for item in ESTADO.get("rodadas", [])
+            if isinstance(item, dict) and str(item.get("id", ""))
+        )
+
+        banco = ESTADO.setdefault("rodadas", [])
+
+        for rodada in rodadas_novas:
+            if not isinstance(rodada, dict):
+                continue
+
+            identificador = str(rodada.get("id", ""))
+
+            if identificador and identificador in existentes:
+                duplicadas += 1
+                continue
+
+            cor = str(rodada.get("cor", ""))
+            if cor not in ("R", "B", "W"):
+                continue
+
+            banco.append(rodada)
+            adicionadas += 1
+
+            if identificador:
+                existentes.add(identificador)
+
+        banco.sort(key=lambda item: str(item.get("data_hora", "")))
+
+        if len(banco) > 50000:
+            del banco[:-50000]
+
+        ESTADO["ultima_atualizacao"] = agora_brasilia()
+        salvar_json(BANCO, ESTADO)
+
+    if adicionadas > 0:
+        atualizar_sinal_e_notificar()
+
+    return {
+        "recebidas": len(rodadas_novas),
+        "adicionadas": adicionadas,
+        "duplicadas": duplicadas
+    }
+
+
+def importar_historico_bestblaze(url=None):
+    """
+    Importa histórico da página pública sem alterar o coletor ao vivo.
+    Se url não for informada, usa a página pública de histórico.
+    """
+    if not url:
+        url = "https://www.bestblaze.com.br/doubleRodadas"
+
+    html = buscar_html_publico(url)
+    rodadas = extrair_bestblaze_historico_html(html)
+
+    if not rodadas:
+        raise RuntimeError(
+            "Histórico respondeu, mas nenhuma rodada confiável foi reconhecida"
+        )
+
+    resultado = adicionar_rodadas_em_lote(rodadas)
+    resultado["url"] = url
+    resultado["total_banco"] = len(ESTADO.get("rodadas", []))
+    return resultado
+
+
+def resumo_cores_historico(limite=1000):
+    """
+    Estatísticas focadas em cores; números ficam apenas como metadado.
+    """
+    with LOCK:
+        bloco = list(ESTADO.get("rodadas", []))[-max(1, int(limite)):]
+
+    contagem = {"R": 0, "B": 0, "W": 0}
+
+    for item in bloco:
+        if not isinstance(item, dict):
+            continue
+        cor = str(item.get("cor", ""))
+        if cor in contagem:
+            contagem[cor] += 1
+
+    total = sum(contagem.values())
+
+    def pct(valor):
+        return (100.0 * valor / total) if total else 0.0
+
+    return {
+        "total": total,
+        "vermelho": {
+            "quantidade": contagem["R"],
+            "percentual": pct(contagem["R"])
+        },
+        "preto": {
+            "quantidade": contagem["B"],
+            "percentual": pct(contagem["B"])
+        },
+        "branco": {
+            "quantidade": contagem["W"],
+            "percentual": pct(contagem["W"])
+        }
+    }
+
+
+def sequencias_cores(limite=1000):
+    with LOCK:
+        dados = [
+            str(item.get("cor", ""))
+            for item in ESTADO.get("rodadas", [])[-max(1, int(limite)):]
+            if isinstance(item, dict)
+        ]
+
+    dados = [c for c in dados if c in ("R", "B", "W")]
+
+    if not dados:
+        return {
+            "maior_vermelho": 0,
+            "maior_preto": 0,
+            "maior_branco": 0,
+            "alternancias": 0
+        }
+
+    max_seq = {"R": 0, "B": 0, "W": 0}
+    atual_cor = None
+    atual_tam = 0
+    alternancias = 0
+
+    anterior = None
+    for cor in dados:
+        if anterior is not None and cor != anterior:
+            alternancias += 1
+        anterior = cor
+
+        if cor == atual_cor:
+            atual_tam += 1
+        else:
+            atual_cor = cor
+            atual_tam = 1
+
+        if atual_tam > max_seq[cor]:
+            max_seq[cor] = atual_tam
+
+    return {
+        "maior_vermelho": max_seq["R"],
+        "maior_preto": max_seq["B"],
+        "maior_branco": max_seq["W"],
+        "alternancias": alternancias
+    }
+
+
+def backtest_cor_simples(cor="R", limite=1000):
+    """
+    Backtest básico e transparente: mede quantas vezes a cor escolhida apareceu
+    no histórico analisado. Não promete previsão futura.
+    """
+    cor = str(cor).upper()
+    if cor not in ("R", "B", "W"):
+        raise ValueError("cor inválida")
+
+    with LOCK:
+        dados = [
+            str(item.get("cor", ""))
+            for item in ESTADO.get("rodadas", [])[-max(1, int(limite)):]
+            if isinstance(item, dict)
+        ]
+
+    dados = [c for c in dados if c in ("R", "B", "W")]
+    total = len(dados)
+    acertos = sum(1 for c in dados if c == cor)
+    taxa = (100.0 * acertos / total) if total else 0.0
+
+    return {
+        "cor": cor,
+        "total": total,
+        "ocorrencias": acertos,
+        "taxa_historica": taxa
+    }
+
+
+
 def buscar_feed():
     cfg = carregar_config()
     url = str(cfg.get("resultados_url", "")).strip() or os.getenv("RESULTADOS_URL", "").strip()
@@ -741,12 +951,8 @@ def buscar_feed():
 
     try:
         if modo_fonte == "bestblaze_html":
-            url = "https://www.bestblaze.com.br/doubleRodadasDia"
             raw_html = buscar_html_publico(url)
             items = extrair_bestblaze_html(raw_html)
-
-            if not items:
-                raise RuntimeError("BestBlaze respondeu, mas nenhuma rodada foi reconhecida no HTML")
         else:
             req = Request(url, headers={"User-Agent": "DoubleBlazeIA/1.0"})
             raw = urlopen(req, timeout=15).read().decode("utf-8")
@@ -832,12 +1038,53 @@ class Handler(BaseHTTPRequestHandler):
         if not self.exigir_autorizacao():
             return
 
-        if self.path == "/":
-            self.enviar_json(200, {
-                "online": True,
-                "servico": "Double Blaze IA 24h",
-                "rotas": ["/status", "/diagnostico", "/fonte-status", "/historico", "/sinal"]
-            })
+        if self.path.startswith("/analise-cores"):
+            limite = 1000
+            try:
+                if "?" in self.path:
+                    query = self.path.split("?", 1)[1]
+                    for parte in query.split("&"):
+                        if parte.startswith("limite="):
+                            limite = int(parte.split("=", 1)[1])
+            except Exception:
+                limite = 1000
+
+            self.enviar_json(200, resumo_cores_historico(limite))
+            return
+
+        if self.path.startswith("/sequencias-cores"):
+            limite = 1000
+            try:
+                if "?" in self.path:
+                    query = self.path.split("?", 1)[1]
+                    for parte in query.split("&"):
+                        if parte.startswith("limite="):
+                            limite = int(parte.split("=", 1)[1])
+            except Exception:
+                limite = 1000
+
+            self.enviar_json(200, sequencias_cores(limite))
+            return
+
+        if self.path.startswith("/backtest-cor"):
+            cor = "R"
+            limite = 1000
+
+            try:
+                if "?" in self.path:
+                    query = self.path.split("?", 1)[1]
+                    for parte in query.split("&"):
+                        if parte.startswith("cor="):
+                            cor = parte.split("=", 1)[1].upper()
+                        elif parte.startswith("limite="):
+                            limite = int(parte.split("=", 1)[1])
+            except Exception:
+                pass
+
+            try:
+                self.enviar_json(200, backtest_cor_simples(cor, limite))
+            except Exception as exc:
+                self.enviar_json(400, {"erro": str(exc)})
             return
 
         if self.path == "/diagnostico":
@@ -968,6 +1215,22 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if not self.exigir_autorizacao():
+            return
+
+        if self.path == "/importar-historico":
+            try:
+                resultado = importar_historico_bestblaze()
+                self.enviar_json(200, {
+                    "ok": True,
+                    "resultado": resultado,
+                    "cores": resumo_cores_historico(1000),
+                    "sequencias": sequencias_cores(1000)
+                })
+            except Exception as exc:
+                self.enviar_json(500, {
+                    "ok": False,
+                    "erro": str(exc)
+                })
             return
 
         if self.path == "/atualizar-agora":
