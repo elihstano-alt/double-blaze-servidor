@@ -94,7 +94,11 @@ ESTADO = {
     "ws_ultimo_source_epoch": 0.0,
     "ws_processamento_ms": None,
     "ws_ultimo_recebido_brasilia": "",
-    "ws_eventos_rolling_recebidos": 0
+    "ws_eventos_rolling_recebidos": 0,
+    "ws_conectado_epoch": 0.0,
+    "ws_ultimo_raw_epoch": 0.0,
+    "sinal_recalculado_inicio": False,
+    "sinal_erro_inicio": ""
 }
 
 CONFIG_PADRAO = {
@@ -418,17 +422,18 @@ def postgres_carregar_rodadas(limite=50000):
         with conectar_postgres() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    SELECT payload
+                    SELECT payload, created_at
                     FROM double_rodadas
-                    ORDER BY momento DESC NULLS LAST, created_at DESC
+                    ORDER BY created_at DESC
                     LIMIT %s
                 """, (limite,))
                 linhas = cur.fetchall()
 
         rodadas = []
 
-        for linha in reversed(linhas):
+        for linha in linhas:
             payload = linha[0]
+            created_at = linha[1]
 
             if isinstance(payload, dict):
                 item = payload
@@ -444,7 +449,26 @@ def postgres_carregar_rodadas(limite=50000):
                 isinstance(item, dict)
                 and item.get("cor") in ("R", "B", "W")
             ):
+                item = dict(item)
+
+                if (
+                    str(item.get("origem", "")) == "blaze_websocket"
+                    and not item.get("recebido_epoch")
+                    and created_at is not None
+                ):
+                    try:
+                        item["recebido_epoch"] = created_at.timestamp()
+                        item["recebido_em_brasilia"] = (
+                            created_at.astimezone(
+                                timezone(timedelta(hours=-3))
+                            ).strftime("%d/%m/%Y %H:%M:%S")
+                        )
+                    except Exception:
+                        pass
+
                 rodadas.append(item)
+
+        rodadas = ordenar_rodadas_canonicas(rodadas)
 
         with LOCK:
             ESTADO["postgres_online"] = True
@@ -530,6 +554,91 @@ def sincronizar_memoria_postgres():
     return resultado
 
 
+def _epoch_brasilia(data_hora):
+    try:
+        dt = datetime.strptime(
+            str(data_hora),
+            "%d/%m/%Y %H:%M:%S"
+        )
+        return dt.replace(
+            tzinfo=timezone(timedelta(hours=-3))
+        ).timestamp()
+    except Exception:
+        return 0.0
+
+
+def momento_efetivo_epoch(item):
+    if not isinstance(item, dict):
+        return 0.0
+
+    if str(item.get("origem", "")) == "blaze_websocket":
+        try:
+            recebido = float(item.get("recebido_epoch", 0.0))
+        except Exception:
+            recebido = 0.0
+
+        if recebido > 0:
+            return recebido
+
+    return _epoch_brasilia(item.get("data_hora", ""))
+
+
+def ordenar_rodadas_canonicas(rodadas):
+    validas = [
+        item for item in rodadas
+        if isinstance(item, dict)
+        and item.get("cor") in ("R", "B", "W")
+    ]
+
+    validas.sort(
+        key=lambda item: (
+            momento_efetivo_epoch(item),
+            str(item.get("id", ""))
+        )
+    )
+
+    return validas[-LIMITE_HISTORICO:]
+
+
+def websocket_tempo_real_saudavel(max_sem_rolling=90.0):
+    agora = time.time()
+
+    with LOCK:
+        online = bool(ESTADO.get("ws_online", False))
+        handshake = bool(
+            ESTADO.get("ws_handshake_recebido", False)
+        )
+        conectado = float(
+            ESTADO.get("ws_conectado_epoch", 0.0)
+        )
+        ultimo_rolling = float(
+            ESTADO.get("ws_ultimo_recebido_epoch", 0.0)
+        )
+
+    if not online or not handshake:
+        return False
+
+    if ultimo_rolling <= 0:
+        return conectado > 0 and agora - conectado <= max_sem_rolling
+
+    return agora - ultimo_rolling <= max_sem_rolling
+
+
+def recalcular_sinal_inicial():
+    try:
+        sinal = calcular_sinal()
+
+        with LOCK:
+            ESTADO["ultimo_sinal"] = sinal
+            ESTADO["sinal_recalculado_inicio"] = True
+            ESTADO["sinal_erro_inicio"] = ""
+
+    except Exception as exc:
+        with LOCK:
+            ESTADO["sinal_recalculado_inicio"] = False
+            ESTADO["sinal_erro_inicio"] = str(exc)
+
+
 def carregar_estado():
     global ESTADO
 
@@ -543,7 +652,9 @@ def carregar_estado():
 
         if rodadas_pg:
             with LOCK:
-                ESTADO["rodadas"] = rodadas_pg
+                ESTADO["rodadas"] = ordenar_rodadas_canonicas(
+                    rodadas_pg
+                )
                 ESTADO["ultima_atualizacao"] = agora_brasilia()
 
 
@@ -1023,7 +1134,10 @@ def estabilidade_configuracao_servidor():
 
 def calcular_sinal():
     with LOCK:
-        data = cores(ESTADO["rodadas"])
+        base_ordenada = ordenar_rodadas_canonicas(
+            list(ESTADO["rodadas"])
+        )
+        data = cores(base_ordenada)
 
     cfg = carregar_config()
 
@@ -1155,9 +1269,7 @@ def adicionar_rodada(rodada):
                     return False
 
         rodadas.append(rodada)
-
-        if len(rodadas) > LIMITE_HISTORICO:
-            del rodadas[:-LIMITE_HISTORICO]
+        rodadas[:] = ordenar_rodadas_canonicas(rodadas)
 
         ESTADO["ultima_atualizacao"] = agora_brasilia()
         salvar_json(BANCO, ESTADO)
@@ -2322,9 +2434,6 @@ def processar_mensagem_ws(msg):
         ) + 1
         ESTADO["ws_ultimo_evento"] = agora_brasilia()
 
-    # Mantém o cálculo antigo apenas como diagnóstico da origem.
-    _registrar_latencia_ws(payload)
-
     rodada = _rodada_payload_ws(payload)
 
     if rodada is None:
@@ -2335,6 +2444,19 @@ def processar_mensagem_ws(msg):
         }
 
     # A partir daqui é um resultado final (rolling).
+    # O relógio confiável é o instante de chegada ao nosso servidor.
+    rodada["recebido_epoch"] = recebido_epoch
+    rodada["recebido_em_brasilia"] = datetime.fromtimestamp(
+        recebido_epoch,
+        timezone(timedelta(hours=-3))
+    ).strftime("%d/%m/%Y %H:%M:%S")
+    rodada["timestamp_fonte"] = (
+        payload.get("updated_at")
+        or payload.get("created_at")
+        or payload.get("rolled_at")
+        or ""
+    )
+
     rodada_id = str(rodada.get("id", ""))
     source_dt = (
         _parse_iso_utc_para_datetime(payload.get("updated_at"))
@@ -2465,6 +2587,7 @@ def worker_websocket_double():
             def on_open(ws):
                 with LOCK:
                     ESTADO["ws_online"] = True
+                    ESTADO["ws_conectado_epoch"] = time.time()
                     ESTADO["ws_ultimo_erro"] = ""
                     ESTADO["ws_assinaturas_enviadas"] = int(
                         ESTADO.get("ws_assinaturas_enviadas", 0)
@@ -2482,6 +2605,7 @@ def worker_websocket_double():
 
             def on_message(ws, msg):
                 with LOCK:
+                    ESTADO["ws_ultimo_raw_epoch"] = time.time()
                     ESTADO["ws_mensagens_raw"] = int(
                         ESTADO.get("ws_mensagens_raw", 0)
                     ) + 1
@@ -2560,60 +2684,93 @@ def status_tempo_real():
     agora_epoch = time.time()
 
     with LOCK:
-        rodadas = list(
-            ESTADO.get("rodadas", [])
+        todas = ordenar_rodadas_canonicas(
+            list(ESTADO.get("rodadas", []))
         )
-        ultimas = rodadas[-20:]
+
+        live = [
+            dict(item)
+            for item in todas
+            if str(item.get("origem", "")) == "blaze_websocket"
+            and float(item.get("recebido_epoch", 0.0) or 0.0) > 0
+        ]
+        live.sort(
+            key=lambda item: float(
+                item.get("recebido_epoch", 0.0)
+            )
+        )
+
         recv_epoch = float(
             ESTADO.get("ws_ultimo_recebido_epoch", 0.0)
         )
 
-        idade_s = (
-            max(0.0, agora_epoch - recv_epoch)
-            if recv_epoch > 0
-            else None
-        )
-
-        sinal = dict(
-            ESTADO.get("ultimo_sinal", {"valido": False})
-        )
-
-        return {
-            "ok": True,
-            "modo": "tempo_real_websocket",
-            "ws_online": bool(
-                ESTADO.get("ws_online", False)
-            ),
+        snapshot = {
+            "ws_online": bool(ESTADO.get("ws_online", False)),
             "ultimo_recebido": str(
                 ESTADO.get("ws_ultimo_recebido_brasilia", "")
             ),
-            "idade_ultimo_resultado_segundos": idade_s,
-            "processamento_ultimo_evento_ms": ESTADO.get(
-                "ws_processamento_ms"
-            ),
-            "eventos_double_tick": int(
-                ESTADO.get("ws_eventos_recebidos", 0)
-            ),
-            "resultados_rolling_recebidos": int(
+            "processamento": ESTADO.get("ws_processamento_ms"),
+            "eventos": int(ESTADO.get("ws_eventos_recebidos", 0)),
+            "rolling": int(
                 ESTADO.get("ws_eventos_rolling_recebidos", 0)
             ),
-            "rodadas_adicionadas": int(
+            "adicionadas": int(
                 ESTADO.get("ws_rodadas_adicionadas", 0)
             ),
-            "duplicadas_detectadas": int(
-                ESTADO.get("ws_duplicadas", 0)
-            ),
-            "fora_de_ordem_detectadas": int(
+            "duplicadas": int(ESTADO.get("ws_duplicadas", 0)),
+            "fora_ordem": int(
                 ESTADO.get("ws_fora_de_ordem", 0)
             ),
-            "lacunas_maiores_60s": int(
+            "lacunas": int(
                 ESTADO.get("ws_suspeitas_gap", 0)
             ),
-            "total_memoria": len(rodadas),
-            "limite_historico": LIMITE_HISTORICO,
-            "sinal_atual": sinal,
-            "ultimas_20_rodadas": ultimas
+            "sinal": dict(
+                ESTADO.get("ultimo_sinal", {"valido": False})
+            ),
+            "sinal_inicio": bool(
+                ESTADO.get("sinal_recalculado_inicio", False)
+            ),
+            "sinal_erro": str(
+                ESTADO.get("sinal_erro_inicio", "")
+            )
         }
+
+    saudavel = websocket_tempo_real_saudavel()
+
+    idade_s = (
+        max(0.0, agora_epoch - recv_epoch)
+        if recv_epoch > 0
+        else None
+    )
+
+    ultimas_live = live[-20:]
+
+    return {
+        "ok": True,
+        "versao": "V53",
+        "modo": "tempo_real_websocket",
+        "ws_online": snapshot["ws_online"],
+        "ws_saudavel": saudavel,
+        "ultimo_recebido": snapshot["ultimo_recebido"],
+        "idade_ultimo_resultado_segundos": idade_s,
+        "processamento_ultimo_evento_ms": snapshot["processamento"],
+        "eventos_double_tick": snapshot["eventos"],
+        "resultados_rolling_recebidos": snapshot["rolling"],
+        "rodadas_adicionadas_ws": snapshot["adicionadas"],
+        "duplicadas_detectadas": snapshot["duplicadas"],
+        "fora_de_ordem_detectadas": snapshot["fora_ordem"],
+        "lacunas_maiores_60s": snapshot["lacunas"],
+        "total_base": len(todas),
+        "total_live_memoria": len(live),
+        "limite_historico": LIMITE_HISTORICO,
+        "sinal_recalculado_inicio": snapshot["sinal_inicio"],
+        "sinal_erro_inicio": snapshot["sinal_erro"],
+        "sinal_atual": snapshot["sinal"],
+        "ultima_rodada_live": (
+            ultimas_live[-1] if ultimas_live else None
+        ),
+        "ultimas_20_live": list(reversed(ultimas_live))
+    }
 
 
 def painel_tempo_real_html():
@@ -2622,44 +2779,115 @@ def painel_tempo_real_html():
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Double Tempo Real</title>
+<title>Double — Tempo Real V53</title>
 <style>
-body{font-family:Arial,sans-serif;background:#111;color:#eee;margin:16px}
-.card{background:#1b1b1b;padding:14px;border-radius:12px;margin-bottom:12px}
-.ok{font-weight:700}
-pre{white-space:pre-wrap;word-break:break-word}
-small{color:#aaa}
+*{box-sizing:border-box}
+body{font-family:Arial,sans-serif;background:#0d0f12;color:#f1f1f1;margin:0;padding:14px}
+h1{font-size:25px;margin:8px 0 14px}
+.card{background:#181b20;border:1px solid #292d34;border-radius:14px;padding:14px;margin-bottom:12px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.metric{background:#111419;border-radius:10px;padding:10px}
+.label{font-size:12px;color:#9da5b1}
+.value{font-size:18px;font-weight:700;margin-top:4px}
+.good{color:#56db87}.bad{color:#ff7373}.warn{color:#ffd166}
+.ball{display:inline-flex;align-items:center;justify-content:center;width:42px;height:42px;border-radius:50%;font-weight:800;margin-right:8px}
+.R{background:#d83a4e}.B{background:#252a32}.W{background:#f3f3f3;color:#111}
+.row{display:flex;align-items:center;border-bottom:1px solid #2a2e35;padding:9px 0}
+.row:last-child{border-bottom:none}
+.time{margin-left:auto;color:#aeb5bf;font-size:13px}
+#signalMain{font-size:24px;font-weight:800}
+.small{font-size:12px;color:#9da5b1;margin-top:6px}
 </style>
 </head>
 <body>
-<h2>Double — Tempo Real</h2>
-<div class="card" id="status">Carregando...</div>
-<div class="card"><b>Sinal atual</b><pre id="sinal"></pre></div>
-<div class="card"><b>Últimas 20 rodadas</b><pre id="rodadas"></pre></div>
-<small>Atualização a cada 1 segundo. O sinal é estatístico e não garante resultado.</small>
+<h1>Double — Tempo Real V53</h1>
+
+<div class="card">
+  <div id="health">Carregando...</div>
+  <div class="grid" style="margin-top:10px">
+    <div class="metric"><div class="label">Último resultado</div><div class="value" id="lastTime">-</div></div>
+    <div class="metric"><div class="label">Idade do resultado</div><div class="value" id="age">-</div></div>
+    <div class="metric"><div class="label">Pipeline servidor</div><div class="value" id="proc">-</div></div>
+    <div class="metric"><div class="label">Base estatística</div><div class="value" id="base">-</div></div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="label">PRÓXIMA RODADA — SINAL ESTATÍSTICO</div>
+  <div id="signalMain">Aguardando cálculo...</div>
+  <div class="small" id="signalDetail"></div>
+</div>
+
+<div class="card">
+  <div class="label">QUALIDADE DA CAPTURA</div>
+  <div class="small" id="quality"></div>
+</div>
+
+<div class="card">
+  <b>Últimas rodadas recebidas AO VIVO</b>
+  <div id="rounds" style="margin-top:8px"></div>
+</div>
+
+<div class="small">
+Feed ao vivo e histórico ficam separados visualmente.
+A base histórica continua sendo usada no modelo.
+Sinais são probabilísticos e não garantem resultado.
+</div>
+
 <script>
+function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function nomeCor(c){return c==='R'?'VERMELHO':c==='B'?'PRETO':c==='W'?'BRANCO':'-';}
 async function atualizar(){
   try{
     const r=await fetch('/tempo-real-json',{cache:'no-store'});
     const d=await r.json();
-    document.getElementById('status').textContent =
-      'WS: '+(d.ws_online?'ONLINE':'OFFLINE')+
-      ' | Último resultado: '+(d.ultimo_recebido||'-')+
-      ' | Idade: '+(d.idade_ultimo_resultado_segundos==null?'-':d.idade_ultimo_resultado_segundos.toFixed(1)+'s')+
-      ' | Processamento: '+(d.processamento_ultimo_evento_ms==null?'-':d.processamento_ultimo_evento_ms.toFixed(1)+'ms')+
+
+    const healthy=d.ws_online && d.ws_saudavel;
+    document.getElementById('health').innerHTML =
+      '<b class="'+(healthy?'good':'bad')+'">WebSocket: '+(healthy?'ONLINE / SAUDÁVEL':'ATENÇÃO')+'</b>';
+
+    document.getElementById('lastTime').textContent=d.ultimo_recebido||'-';
+    document.getElementById('age').textContent=
+      d.idade_ultimo_resultado_segundos==null?'-':d.idade_ultimo_resultado_segundos.toFixed(1)+' s';
+    document.getElementById('proc').textContent=
+      d.processamento_ultimo_evento_ms==null?'-':d.processamento_ultimo_evento_ms.toFixed(1)+' ms';
+    document.getElementById('base').textContent=d.total_base+' / '+d.limite_historico;
+
+    const s=d.sinal_atual||{};
+    if(s.valido){
+      document.getElementById('signalMain').textContent=nomeCor(s.cor);
+      document.getElementById('signalDetail').textContent=
+        'Probabilidade do modelo: '+((Number(s.probabilidade)||0)*100).toFixed(1)+'% | Amostras: '+(s.amostras??'-')+
+        ' | Concordância: '+(s.concordancia_modelos??'-')+'/'+(s.total_modelos??'-');
+    }else{
+      document.getElementById('signalMain').textContent='SEM ENTRADA';
+      document.getElementById('signalDetail').textContent=
+        'Os filtros atuais não aprovaram uma entrada. O sistema não inventa sinal.';
+    }
+
+    document.getElementById('quality').textContent=
+      'Rolling recebidos: '+d.resultados_rolling_recebidos+
+      ' | Adicionados: '+d.rodadas_adicionadas_ws+
       ' | Duplicadas: '+d.duplicadas_detectadas+
       ' | Fora de ordem: '+d.fora_de_ordem_detectadas+
       ' | Lacunas >60s: '+d.lacunas_maiores_60s;
-    document.getElementById('sinal').textContent=JSON.stringify(d.sinal_atual,null,2);
-    document.getElementById('rodadas').textContent=JSON.stringify(d.ultimas_20_rodadas.slice().reverse(),null,2);
+
+    const rounds=d.ultimas_20_live||[];
+    document.getElementById('rounds').innerHTML = rounds.length ? rounds.map(x=>
+      '<div class="row"><span class="ball '+esc(x.cor)+'">'+esc(x.numero??nomeCor(x.cor)[0])+'</span>'+
+      '<div><b>'+esc(nomeCor(x.cor))+'</b><div class="small">'+esc(x.id)+'</div></div>'+
+      '<div class="time">'+esc(x.recebido_em_brasilia||x.data_hora||'')+'</div></div>'
+    ).join('') : '<div class="small">Aguardando a primeira rodada ao vivo após este deploy...</div>';
   }catch(e){
-    document.getElementById('status').textContent='Erro: '+e;
+    document.getElementById('health').innerHTML='<b class="bad">Erro ao atualizar: '+esc(e)+'</b>';
   }
 }
 atualizar();
-setInterval(atualizar,1000);
+setInterval(atualizar,750);
 </script>
 </body></html>"""
+
+
 
 
 def diagnostico_websocket():
@@ -2719,11 +2947,9 @@ def diagnostico_websocket():
                     0
                 )
             ),
-            "latencia_segundos": ESTADO.get(
-                "ws_latencia_segundos"
-            ),
-            "latencia_media_segundos": ESTADO.get(
-                "ws_latencia_media_segundos"
+            "nota_timestamp_fonte": (
+                "updated_at da fonte não é tratado como latência; "
+                "o relógio operacional é o recebimento no servidor"
             ),
             "processamento_ms": ESTADO.get(
                 "ws_processamento_ms"
@@ -2934,6 +3160,10 @@ def worker_feed():
     ultimo_fallback_epoch = 0.0
 
     while True:
+        if websocket_tempo_real_saudavel():
+            time.sleep(10)
+            continue
+
         cfg = carregar_config()
         intervalo = int(
             cfg.get(
@@ -3131,7 +3361,7 @@ class Handler(BaseHTTPRequestHandler):
 
             self.enviar_json(200, {
                 "ok": True,
-                "versao": "V52",
+                "versao": "V53",
                 "fonte_online": fonte_online,
                 "rodadas": len(banco),
                 "vermelhos": sum(
@@ -3665,6 +3895,12 @@ def main():
         salvar_json(CONFIG, CONFIG_PADRAO)
 
     porta = int(os.getenv("PORT", os.getenv("PORTA", "8787")))
+
+    thread_sinal = threading.Thread(
+        target=recalcular_sinal_inicial,
+        daemon=True
+    )
+    thread_sinal.start()
 
     thread = threading.Thread(
         target=worker_feed,
