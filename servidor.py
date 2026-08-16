@@ -848,6 +848,19 @@ def extrair_bestblaze_historico_html(html):
     return rodadas
 
 
+def _atributo_html(tag, nome):
+    """Extrai atributo HTML independentemente da ordem e do tipo de aspas."""
+    nome_esc = re.escape(str(nome))
+    padrao_texto = "(?:^|\\s)" + nome_esc + "\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s>]+))"
+    achado = re.search(padrao_texto, tag or "", re.IGNORECASE)
+    if not achado:
+        return ""
+    for valor in achado.groups():
+        if valor is not None:
+            return unescape(valor)
+    return ""
+
+
 def detectar_formulario_periodo_bestblaze(html, base_url):
     """
     Detecta o formulário real de filtro, incluindo campos ocultos/CSRF.
@@ -1536,7 +1549,7 @@ class Handler(BaseHTTPRequestHandler):
 
             self.enviar_json(200, {
                 "ok": True,
-                "versao": "V37",
+                "versao": "V38",
                 "fonte_online": fonte_online,
                 "rodadas": len(banco),
                 "vermelhos": sum(
