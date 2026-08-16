@@ -2340,6 +2340,15 @@ def processar_mensagem_ws(msg):
 
 
 def worker_websocket_double():
+    """
+    WebSocket Double com heartbeat Engine.IO textual.
+
+    O servidor usa Engine.IO v3 sobre WebSocket. O keepalive é feito
+    enviando a mensagem de TEXTO "2" periodicamente e respondendo
+    "3" quando o servidor enviar "2".
+
+    Não usamos WebSocket ping frame para o heartbeat da aplicação.
+    """
     if websocket is None:
         with LOCK:
             ESTADO["ws_online"] = False
@@ -2350,18 +2359,33 @@ def worker_websocket_double():
         "wss://api-gaming.blaze.bet.br"
         "/replication/?EIO=3&transport=websocket"
     )
+
     assinatura = (
         '420["cmd",{"id":"subscribe",'
         '"payload":{"room":"double_room_1"}}]'
     )
 
     while True:
+        heartbeat_stop = threading.Event()
+
         try:
             with LOCK:
                 ESTADO["ws_endpoint_atual"] = url
                 ESTADO["ws_online"] = False
                 ESTADO["ws_handshake_recebido"] = False
                 ESTADO["ws_ultimo_erro"] = ""
+
+            def heartbeat_texto(ws):
+                while not heartbeat_stop.wait(10):
+                    try:
+                        if ws.sock and ws.sock.connected:
+                            ws.send("2")
+                    except Exception as exc:
+                        with LOCK:
+                            ESTADO["ws_ultimo_erro"] = (
+                                "heartbeat texto: %s" % exc
+                            )
+                        break
 
             def on_open(ws):
                 with LOCK:
@@ -2370,21 +2394,37 @@ def worker_websocket_double():
                     ESTADO["ws_assinaturas_enviadas"] = int(
                         ESTADO.get("ws_assinaturas_enviadas", 0)
                     ) + 1
+
+                # Assina o Double.
                 ws.send(assinatura)
+
+                # Heartbeat Engine.IO: texto "2" a cada 10s.
+                threading.Thread(
+                    target=heartbeat_texto,
+                    args=(ws,),
+                    daemon=True
+                ).start()
 
             def on_message(ws, msg):
                 with LOCK:
                     ESTADO["ws_mensagens_raw"] = int(
                         ESTADO.get("ws_mensagens_raw", 0)
                     ) + 1
-                    texto = msg if isinstance(msg, str) else repr(msg)
+
+                    texto = (
+                        msg
+                        if isinstance(msg, str)
+                        else repr(msg)
+                    )
                     ESTADO["ws_ultimo_raw"] = texto[:500]
 
+                # Handshake Engine.IO.
                 if isinstance(msg, str) and msg.startswith("0"):
                     with LOCK:
                         ESTADO["ws_handshake_recebido"] = True
                     return
 
+                # Ping Engine.IO recebido -> pong textual.
                 if msg == "2":
                     try:
                         ws.send("3")
@@ -2395,11 +2435,13 @@ def worker_websocket_double():
                 processar_mensagem_ws(msg)
 
             def on_error(ws, erro):
+                heartbeat_stop.set()
                 with LOCK:
                     ESTADO["ws_online"] = False
                     ESTADO["ws_ultimo_erro"] = str(erro)
 
             def on_close(ws, codigo, motivo):
+                heartbeat_stop.set()
                 with LOCK:
                     ESTADO["ws_online"] = False
                     ESTADO["ws_ultimo_erro"] = (
@@ -2413,29 +2455,29 @@ def worker_websocket_double():
                 on_error=on_error,
                 on_close=on_close,
                 header=[
-                    "Upgrade: websocket",
-                    "Pragma: no-cache",
-                    "Connection: Upgrade",
-                    "Accept-Encoding: gzip, deflate, br",
-                    "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/102.0.0.0 Safari/537.36"
+                    (
+                        "User-Agent: Mozilla/5.0 "
+                        "(Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) "
+                        "Chrome/126.0 Safari/537.36"
+                    )
                 ]
             )
 
+            # Sem ping_interval/ping_payload:
+            # o keepalive da aplicação é Engine.IO textual.
             app.run_forever(
-                ping_interval=10,
-                ping_timeout=5,
-                ping_payload="2",
-                origin="https://api-gaming.blaze.com",
-                host="api-v2.blaze1.space"
+                origin="https://blaze.bet.br"
             )
 
         except Exception as exc:
+            heartbeat_stop.set()
             with LOCK:
                 ESTADO["ws_online"] = False
                 ESTADO["ws_ultimo_erro"] = str(exc)
 
+        heartbeat_stop.set()
         time.sleep(2)
 
 
@@ -2471,6 +2513,7 @@ def diagnostico_websocket():
             "sala": "double_room_1",
             "pacote_assinatura": "420",
             "formato_evento": "data -> id=double.tick",
+            "heartbeat": "Engine.IO texto 2 a cada 10s",
             "handshake_recebido": bool(
                 ESTADO.get(
                     "ws_handshake_recebido",
@@ -2877,7 +2920,7 @@ class Handler(BaseHTTPRequestHandler):
 
             self.enviar_json(200, {
                 "ok": True,
-                "versao": "V50",
+                "versao": "V51",
                 "fonte_online": fonte_online,
                 "rodadas": len(banco),
                 "vermelhos": sum(
