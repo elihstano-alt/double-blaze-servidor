@@ -1038,6 +1038,24 @@ class Handler(BaseHTTPRequestHandler):
         if not self.exigir_autorizacao():
             return
 
+        # V32: permite acionar a importacao historica diretamente pelo navegador.
+        # Mantem a rota POST original e nao altera o coletor ao vivo.
+        if self.path == "/importar-historico":
+            try:
+                resultado = importar_historico_bestblaze()
+                self.enviar_json(200, {
+                    "ok": True,
+                    "resultado": resultado,
+                    "cores": resumo_cores_historico(1000),
+                    "sequencias": sequencias_cores(1000)
+                })
+            except Exception as exc:
+                self.enviar_json(500, {
+                    "ok": False,
+                    "erro": str(exc)
+                })
+            return
+
         if self.path.startswith("/analise-cores"):
             limite = 1000
             try:
