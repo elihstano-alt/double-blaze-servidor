@@ -85,7 +85,16 @@ ESTADO = {
     "ws_ultimo_raw": "",
     "ws_endpoint_atual": "",
     "ws_assinaturas_enviadas": 0,
-    "ws_handshake_recebido": False
+    "ws_handshake_recebido": False,
+    "ws_duplicadas": 0,
+    "ws_fora_de_ordem": 0,
+    "ws_suspeitas_gap": 0,
+    "ws_ultimo_id_rolling": "",
+    "ws_ultimo_recebido_epoch": 0.0,
+    "ws_ultimo_source_epoch": 0.0,
+    "ws_processamento_ms": None,
+    "ws_ultimo_recebido_brasilia": "",
+    "ws_eventos_rolling_recebidos": 0
 }
 
 CONFIG_PADRAO = {
@@ -2268,6 +2277,9 @@ def _rodada_payload_ws(payload):
 
 
 def processar_mensagem_ws(msg):
+    inicio_proc = time.perf_counter()
+    recebido_epoch = time.time()
+
     if not isinstance(msg, str):
         return {"evento": False, "adicionada": False}
 
@@ -2310,7 +2322,9 @@ def processar_mensagem_ws(msg):
         ) + 1
         ESTADO["ws_ultimo_evento"] = agora_brasilia()
 
+    # Mantém o cálculo antigo apenas como diagnóstico da origem.
     _registrar_latencia_ws(payload)
+
     rodada = _rodada_payload_ws(payload)
 
     if rodada is None:
@@ -2320,10 +2334,70 @@ def processar_mensagem_ws(msg):
             "status": str(payload.get("status", ""))
         }
 
+    # A partir daqui é um resultado final (rolling).
+    rodada_id = str(rodada.get("id", ""))
+    source_dt = (
+        _parse_iso_utc_para_datetime(payload.get("updated_at"))
+        or _parse_iso_utc_para_datetime(payload.get("created_at"))
+        or _parse_iso_utc_para_datetime(payload.get("rolled_at"))
+    )
+    source_epoch = source_dt.timestamp() if source_dt else 0.0
+
+    with LOCK:
+        ESTADO["ws_eventos_rolling_recebidos"] = int(
+            ESTADO.get("ws_eventos_rolling_recebidos", 0)
+        ) + 1
+
+        ultimo_id = str(
+            ESTADO.get("ws_ultimo_id_rolling", "")
+        )
+        ultimo_recv = float(
+            ESTADO.get("ws_ultimo_recebido_epoch", 0.0)
+        )
+        ultimo_source = float(
+            ESTADO.get("ws_ultimo_source_epoch", 0.0)
+        )
+
+        if rodada_id and rodada_id == ultimo_id:
+            ESTADO["ws_duplicadas"] = int(
+                ESTADO.get("ws_duplicadas", 0)
+            ) + 1
+
+        if (
+            source_epoch > 0
+            and ultimo_source > 0
+            and source_epoch < ultimo_source
+        ):
+            ESTADO["ws_fora_de_ordem"] = int(
+                ESTADO.get("ws_fora_de_ordem", 0)
+            ) + 1
+
+        # Não afirma "rodada perdida": apenas marca uma lacuna temporal suspeita.
+        if (
+            ultimo_recv > 0
+            and recebido_epoch - ultimo_recv > 60.0
+        ):
+            ESTADO["ws_suspeitas_gap"] = int(
+                ESTADO.get("ws_suspeitas_gap", 0)
+            ) + 1
+
+        ESTADO["ws_ultimo_id_rolling"] = rodada_id
+        ESTADO["ws_ultimo_recebido_epoch"] = recebido_epoch
+        ESTADO["ws_ultimo_recebido_brasilia"] = agora_brasilia()
+
+        if source_epoch > 0:
+            ESTADO["ws_ultimo_source_epoch"] = source_epoch
+
     adicionada = adicionar_rodada(rodada)
 
-    if adicionada:
-        with LOCK:
+    processamento_ms = (
+        time.perf_counter() - inicio_proc
+    ) * 1000.0
+
+    with LOCK:
+        ESTADO["ws_processamento_ms"] = processamento_ms
+
+        if adicionada:
             ESTADO["ws_rodadas_adicionadas"] = int(
                 ESTADO.get("ws_rodadas_adicionadas", 0)
             ) + 1
@@ -2335,7 +2409,8 @@ def processar_mensagem_ws(msg):
     return {
         "evento": True,
         "adicionada": bool(adicionada),
-        "rodada": rodada
+        "rodada": rodada,
+        "processamento_ms": processamento_ms
     }
 
 
@@ -2481,6 +2556,112 @@ def worker_websocket_double():
         time.sleep(2)
 
 
+def status_tempo_real():
+    agora_epoch = time.time()
+
+    with LOCK:
+        rodadas = list(
+            ESTADO.get("rodadas", [])
+        )
+        ultimas = rodadas[-20:]
+        recv_epoch = float(
+            ESTADO.get("ws_ultimo_recebido_epoch", 0.0)
+        )
+
+        idade_s = (
+            max(0.0, agora_epoch - recv_epoch)
+            if recv_epoch > 0
+            else None
+        )
+
+        sinal = dict(
+            ESTADO.get("ultimo_sinal", {"valido": False})
+        )
+
+        return {
+            "ok": True,
+            "modo": "tempo_real_websocket",
+            "ws_online": bool(
+                ESTADO.get("ws_online", False)
+            ),
+            "ultimo_recebido": str(
+                ESTADO.get("ws_ultimo_recebido_brasilia", "")
+            ),
+            "idade_ultimo_resultado_segundos": idade_s,
+            "processamento_ultimo_evento_ms": ESTADO.get(
+                "ws_processamento_ms"
+            ),
+            "eventos_double_tick": int(
+                ESTADO.get("ws_eventos_recebidos", 0)
+            ),
+            "resultados_rolling_recebidos": int(
+                ESTADO.get("ws_eventos_rolling_recebidos", 0)
+            ),
+            "rodadas_adicionadas": int(
+                ESTADO.get("ws_rodadas_adicionadas", 0)
+            ),
+            "duplicadas_detectadas": int(
+                ESTADO.get("ws_duplicadas", 0)
+            ),
+            "fora_de_ordem_detectadas": int(
+                ESTADO.get("ws_fora_de_ordem", 0)
+            ),
+            "lacunas_maiores_60s": int(
+                ESTADO.get("ws_suspeitas_gap", 0)
+            ),
+            "total_memoria": len(rodadas),
+            "limite_historico": LIMITE_HISTORICO,
+            "sinal_atual": sinal,
+            "ultimas_20_rodadas": ultimas
+        }
+
+
+def painel_tempo_real_html():
+    return """<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Double Tempo Real</title>
+<style>
+body{font-family:Arial,sans-serif;background:#111;color:#eee;margin:16px}
+.card{background:#1b1b1b;padding:14px;border-radius:12px;margin-bottom:12px}
+.ok{font-weight:700}
+pre{white-space:pre-wrap;word-break:break-word}
+small{color:#aaa}
+</style>
+</head>
+<body>
+<h2>Double — Tempo Real</h2>
+<div class="card" id="status">Carregando...</div>
+<div class="card"><b>Sinal atual</b><pre id="sinal"></pre></div>
+<div class="card"><b>Últimas 20 rodadas</b><pre id="rodadas"></pre></div>
+<small>Atualização a cada 1 segundo. O sinal é estatístico e não garante resultado.</small>
+<script>
+async function atualizar(){
+  try{
+    const r=await fetch('/tempo-real-json',{cache:'no-store'});
+    const d=await r.json();
+    document.getElementById('status').textContent =
+      'WS: '+(d.ws_online?'ONLINE':'OFFLINE')+
+      ' | Último resultado: '+(d.ultimo_recebido||'-')+
+      ' | Idade: '+(d.idade_ultimo_resultado_segundos==null?'-':d.idade_ultimo_resultado_segundos.toFixed(1)+'s')+
+      ' | Processamento: '+(d.processamento_ultimo_evento_ms==null?'-':d.processamento_ultimo_evento_ms.toFixed(1)+'ms')+
+      ' | Duplicadas: '+d.duplicadas_detectadas+
+      ' | Fora de ordem: '+d.fora_de_ordem_detectadas+
+      ' | Lacunas >60s: '+d.lacunas_maiores_60s;
+    document.getElementById('sinal').textContent=JSON.stringify(d.sinal_atual,null,2);
+    document.getElementById('rodadas').textContent=JSON.stringify(d.ultimas_20_rodadas.slice().reverse(),null,2);
+  }catch(e){
+    document.getElementById('status').textContent='Erro: '+e;
+  }
+}
+atualizar();
+setInterval(atualizar,1000);
+</script>
+</body></html>"""
+
+
 def diagnostico_websocket():
     with LOCK:
         return {
@@ -2543,6 +2724,24 @@ def diagnostico_websocket():
             ),
             "latencia_media_segundos": ESTADO.get(
                 "ws_latencia_media_segundos"
+            ),
+            "processamento_ms": ESTADO.get(
+                "ws_processamento_ms"
+            ),
+            "duplicadas": int(
+                ESTADO.get("ws_duplicadas", 0)
+            ),
+            "fora_de_ordem": int(
+                ESTADO.get("ws_fora_de_ordem", 0)
+            ),
+            "lacunas_maiores_60s": int(
+                ESTADO.get("ws_suspeitas_gap", 0)
+            ),
+            "rolling_recebidos": int(
+                ESTADO.get("ws_eventos_rolling_recebidos", 0)
+            ),
+            "ultimo_recebido_brasilia": str(
+                ESTADO.get("ws_ultimo_recebido_brasilia", "")
             ),
             "total_memoria": len(
                 ESTADO.get("rodadas", [])
@@ -2840,6 +3039,18 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(corpo)
 
+    def enviar_html(self, codigo, html):
+        corpo = html.encode("utf-8")
+        self.send_response(codigo)
+        self.send_header(
+            "Content-Type",
+            "text/html; charset=utf-8"
+        )
+        self.send_header("Content-Length", str(len(corpo)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(corpo)
+
     def ler_json(self):
         tamanho = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(tamanho) if tamanho else b"{}"
@@ -2920,7 +3131,7 @@ class Handler(BaseHTTPRequestHandler):
 
             self.enviar_json(200, {
                 "ok": True,
-                "versao": "V51",
+                "versao": "V52",
                 "fonte_online": fonte_online,
                 "rodadas": len(banco),
                 "vermelhos": sum(
@@ -3021,6 +3232,20 @@ class Handler(BaseHTTPRequestHandler):
                     "ok": False,
                     "erro": str(exc)
                 })
+            return
+
+        if self.path == "/tempo-real":
+            self.enviar_html(
+                200,
+                painel_tempo_real_html()
+            )
+            return
+
+        if self.path == "/tempo-real-json":
+            self.enviar_json(
+                200,
+                status_tempo_real()
+            )
             return
 
         if self.path == "/diagnostico-websocket":
