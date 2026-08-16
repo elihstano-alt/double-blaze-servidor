@@ -14,6 +14,7 @@ RESULTADOS_URL=https://exemplo.com/resultados.json
 INTERVALO_SEGUNDOS=10
 NTFY_SERVER=https://ntfy.sh
 NTFY_TOPIC=seu_topico_privado
+DATABASE_URL=postgresql://... (Supabase)
 """
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -29,6 +30,11 @@ import threading
 import time
 import re
 from html import unescape
+
+try:
+    import psycopg
+except Exception:
+    psycopg = None
 
 BASE = Path(__file__).resolve().parent
 BANCO = BASE / "banco_servidor.json"
@@ -50,7 +56,10 @@ ESTADO = {
     "ultimo_erro_fonte": "",
     "total_importadas": 0,
     "historico_sinais": [],
-    "ultima_notificacao_epoch": 0.0
+    "ultima_notificacao_epoch": 0.0,
+    "postgres_online": False,
+    "ultimo_erro_postgres": "",
+    "ultima_sincronizacao_postgres": ""
 }
 
 CONFIG_PADRAO = {
@@ -143,11 +152,315 @@ def salvar_json(path, obj):
     tmp.replace(path)
 
 
+def database_url():
+    return os.getenv("DATABASE_URL", "").strip()
+
+
+def postgres_configurado():
+    return bool(database_url())
+
+
+def postgres_driver_ok():
+    return psycopg is not None
+
+
+def conectar_postgres():
+    if not postgres_configurado():
+        raise RuntimeError("DATABASE_URL não configurada")
+
+    if psycopg is None:
+        raise RuntimeError(
+            "driver psycopg não instalado; confira requirements.txt"
+        )
+
+    # Supabase Transaction Pooler não suporta prepared statements.
+    return psycopg.connect(
+        database_url(),
+        connect_timeout=12,
+        prepare_threshold=None
+    )
+
+
+def postgres_inicializar():
+    if not postgres_configurado():
+        return False
+
+    try:
+        with conectar_postgres() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS double_rodadas (
+                        id TEXT PRIMARY KEY,
+                        data_hora TEXT NOT NULL UNIQUE,
+                        momento TIMESTAMP WITHOUT TIME ZONE,
+                        numero INTEGER,
+                        cor CHAR(1) NOT NULL
+                            CHECK (cor IN ('R','B','W')),
+                        origem TEXT,
+                        payload JSONB NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL
+                            DEFAULT NOW()
+                    )
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS
+                    idx_double_rodadas_momento
+                    ON double_rodadas (momento)
+                """)
+
+        with LOCK:
+            ESTADO["postgres_online"] = True
+            ESTADO["ultimo_erro_postgres"] = ""
+        return True
+
+    except Exception as exc:
+        with LOCK:
+            ESTADO["postgres_online"] = False
+            ESTADO["ultimo_erro_postgres"] = str(exc)
+        return False
+
+
+def _momento_postgres(data_hora):
+    try:
+        return datetime.strptime(
+            str(data_hora),
+            "%d/%m/%Y %H:%M:%S"
+        )
+    except Exception:
+        return None
+
+
+def postgres_salvar_rodadas(rodadas):
+    if not rodadas:
+        return {
+            "ok": True,
+            "recebidas": 0,
+            "gravadas_ou_existentes": 0
+        }
+
+    if not postgres_configurado():
+        return {
+            "ok": False,
+            "erro": "DATABASE_URL não configurada",
+            "recebidas": len(rodadas)
+        }
+
+    try:
+        linhas = []
+
+        for item in rodadas:
+            if not isinstance(item, dict):
+                continue
+
+            identificador = str(item.get("id", "")).strip()
+            data_hora = str(item.get("data_hora", "")).strip()
+            cor = str(item.get("cor", "")).strip().upper()
+
+            if not identificador or not data_hora:
+                continue
+            if cor not in ("R", "B", "W"):
+                continue
+
+            numero = item.get("numero")
+            try:
+                numero = int(numero) if numero is not None else None
+            except Exception:
+                numero = None
+
+            linhas.append((
+                identificador,
+                data_hora,
+                _momento_postgres(data_hora),
+                numero,
+                cor,
+                str(item.get("origem", "")),
+                json.dumps(item, ensure_ascii=False)
+            ))
+
+        if not linhas:
+            return {
+                "ok": True,
+                "recebidas": len(rodadas),
+                "gravadas_ou_existentes": 0
+            }
+
+        with conectar_postgres() as conn:
+            with conn.cursor() as cur:
+                cur.executemany("""
+                    INSERT INTO double_rodadas (
+                        id,
+                        data_hora,
+                        momento,
+                        numero,
+                        cor,
+                        origem,
+                        payload
+                    )
+                    VALUES (
+                        %s, %s, %s, %s, %s, %s, %s::jsonb
+                    )
+                    ON CONFLICT DO NOTHING
+                """, linhas)
+
+        with LOCK:
+            ESTADO["postgres_online"] = True
+            ESTADO["ultimo_erro_postgres"] = ""
+            ESTADO["ultima_sincronizacao_postgres"] = agora_brasilia()
+
+        return {
+            "ok": True,
+            "recebidas": len(rodadas),
+            "gravadas_ou_existentes": len(linhas)
+        }
+
+    except Exception as exc:
+        with LOCK:
+            ESTADO["postgres_online"] = False
+            ESTADO["ultimo_erro_postgres"] = str(exc)
+
+        return {
+            "ok": False,
+            "erro": str(exc),
+            "recebidas": len(rodadas)
+        }
+
+
+def postgres_carregar_rodadas(limite=50000):
+    limite = max(1, min(int(limite), 50000))
+
+    if not postgres_configurado():
+        return []
+
+    try:
+        with conectar_postgres() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT payload
+                    FROM double_rodadas
+                    ORDER BY momento DESC NULLS LAST, created_at DESC
+                    LIMIT %s
+                """, (limite,))
+                linhas = cur.fetchall()
+
+        rodadas = []
+
+        for linha in reversed(linhas):
+            payload = linha[0]
+
+            if isinstance(payload, dict):
+                item = payload
+            elif isinstance(payload, str):
+                try:
+                    item = json.loads(payload)
+                except Exception:
+                    continue
+            else:
+                continue
+
+            if (
+                isinstance(item, dict)
+                and item.get("cor") in ("R", "B", "W")
+            ):
+                rodadas.append(item)
+
+        with LOCK:
+            ESTADO["postgres_online"] = True
+            ESTADO["ultimo_erro_postgres"] = ""
+
+        return rodadas
+
+    except Exception as exc:
+        with LOCK:
+            ESTADO["postgres_online"] = False
+            ESTADO["ultimo_erro_postgres"] = str(exc)
+        return []
+
+
+def postgres_status():
+    resultado = {
+        "ok": False,
+        "configurado": postgres_configurado(),
+        "driver_psycopg": postgres_driver_ok(),
+        "online": False,
+        "total_rodadas_postgres": 0,
+        "total_rodadas_memoria": 0,
+        "ultima_sincronizacao": "",
+        "erro": ""
+    }
+
+    with LOCK:
+        resultado["total_rodadas_memoria"] = len(
+            ESTADO.get("rodadas", [])
+        )
+        resultado["ultima_sincronizacao"] = str(
+            ESTADO.get(
+                "ultima_sincronizacao_postgres",
+                ""
+            )
+        )
+
+    if not resultado["configurado"]:
+        resultado["erro"] = "DATABASE_URL não configurada"
+        return resultado
+
+    if not resultado["driver_psycopg"]:
+        resultado["erro"] = "psycopg não instalado"
+        return resultado
+
+    try:
+        if not postgres_inicializar():
+            with LOCK:
+                resultado["erro"] = str(
+                    ESTADO.get("ultimo_erro_postgres", "")
+                )
+            return resultado
+
+        with conectar_postgres() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
+                cur.execute(
+                    "SELECT COUNT(*) FROM double_rodadas"
+                )
+                total = int(cur.fetchone()[0])
+
+        resultado["ok"] = True
+        resultado["online"] = True
+        resultado["total_rodadas_postgres"] = total
+        return resultado
+
+    except Exception as exc:
+        resultado["erro"] = str(exc)
+        return resultado
+
+
+def sincronizar_memoria_postgres():
+    with LOCK:
+        snapshot = list(ESTADO.get("rodadas", []))
+
+    resultado = postgres_salvar_rodadas(snapshot)
+
+    if resultado.get("ok"):
+        resultado["total_memoria"] = len(snapshot)
+
+    return resultado
+
+
 def carregar_estado():
     global ESTADO
+
     data = carregar_json(BANCO, ESTADO)
     if isinstance(data, dict):
         ESTADO = data
+
+    if postgres_configurado():
+        postgres_inicializar()
+        rodadas_pg = postgres_carregar_rodadas(50000)
+
+        if rodadas_pg:
+            with LOCK:
+                ESTADO["rodadas"] = rodadas_pg
+                ESTADO["ultima_atualizacao"] = agora_brasilia()
 
 
 def carregar_config():
@@ -765,6 +1078,9 @@ def adicionar_rodada(rodada):
         ESTADO["ultima_atualizacao"] = agora_brasilia()
         salvar_json(BANCO, ESTADO)
 
+    if postgres_configurado():
+        postgres_salvar_rodadas([rodada])
+
     atualizar_sinal_e_notificar()
     return True
 
@@ -1323,6 +1639,7 @@ def adicionar_rodadas_em_lote(rodadas_novas):
 
     adicionadas = 0
     duplicadas = 0
+    novas_adicionadas = []
 
     with LOCK:
         existentes = set(
@@ -1358,6 +1675,7 @@ def adicionar_rodadas_em_lote(rodadas_novas):
                 continue
 
             banco.append(rodada)
+            novas_adicionadas.append(dict(rodada))
             adicionadas += 1
 
             if identificador:
@@ -1383,6 +1701,9 @@ def adicionar_rodadas_em_lote(rodadas_novas):
         salvar_json(BANCO, ESTADO)
 
     if adicionadas > 0:
+        if postgres_configurado():
+            postgres_salvar_rodadas(novas_adicionadas)
+
         atualizar_sinal_e_notificar()
 
     return {
@@ -1911,7 +2232,7 @@ class Handler(BaseHTTPRequestHandler):
 
             self.enviar_json(200, {
                 "ok": True,
-                "versao": "V43",
+                "versao": "V45",
                 "fonte_online": fonte_online,
                 "rodadas": len(banco),
                 "vermelhos": sum(
@@ -2012,6 +2333,21 @@ class Handler(BaseHTTPRequestHandler):
                     "ok": False,
                     "erro": str(exc)
                 })
+            return
+
+        if self.path == "/status-postgres":
+            self.enviar_json(
+                200,
+                postgres_status()
+            )
+            return
+
+        if self.path == "/sincronizar-postgres":
+            resultado = sincronizar_memoria_postgres()
+            self.enviar_json(
+                200 if resultado.get("ok") else 500,
+                resultado
+            )
             return
 
         if self.path.startswith("/painel-analise"):
@@ -2370,6 +2706,9 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     carregar_estado()
+
+    if postgres_configurado():
+        postgres_inicializar()
 
     if not CONFIG.exists():
         salvar_json(CONFIG, CONFIG_PADRAO)
