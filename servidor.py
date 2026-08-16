@@ -1206,6 +1206,37 @@ def calcular_sinal():
 
 
 
+
+def limite_atraso_fonte_servidor():
+    try:
+        return max(
+            0.1,
+            float(
+                os.getenv(
+                    "MAX_ATRASO_FONTE_SERVIDOR_SEGUNDOS",
+                    "2.0"
+                )
+            )
+        )
+    except Exception:
+        return 2.0
+
+
+def limite_idade_sinal():
+    try:
+        return max(
+            0.5,
+            float(
+                os.getenv(
+                    "MAX_IDADE_SINAL_SEGUNDOS",
+                    "5.0"
+                )
+            )
+        )
+    except Exception:
+        return 5.0
+
+
 def calcular_sinal_tempo_real():
     """
     Caminho rápido para a próxima rodada AO VIVO.
@@ -1273,19 +1304,51 @@ def calcular_sinal_tempo_real():
         cfg.get("amostras_minimas", 20)
     )
 
-    valido = (
-        probs.get(escolha, 0.0) >= limite
-        and amostras >= amostras_minimas
-        and concordancia_ok
-        and estabilidade_ok
-    )
+    prob_atual = float(probs.get(escolha, 0.0))
+
+    filtros = {
+        "probabilidade_ok": prob_atual >= limite,
+        "amostras_ok": amostras >= amostras_minimas,
+        "concordancia_ok": bool(concordancia_ok),
+        "estabilidade_ok": bool(estabilidade_ok)
+    }
+
+    motivos_rejeicao = []
+
+    if not filtros["probabilidade_ok"]:
+        motivos_rejeicao.append(
+            "probabilidade %.1f%% < mínimo %.1f%%"
+            % (prob_atual * 100.0, limite * 100.0)
+        )
+
+    if not filtros["amostras_ok"]:
+        motivos_rejeicao.append(
+            "amostras %d < mínimo %d"
+            % (amostras, amostras_minimas)
+        )
+
+    if not filtros["concordancia_ok"]:
+        motivos_rejeicao.append(
+            "concordância %d/%d abaixo do mínimo %d"
+            % (
+                int(detalhes_concordancia.get("acordos", 0)),
+                total_modelos,
+                concordancia_minima
+            )
+        )
+
+    if not filtros["estabilidade_ok"]:
+        motivos_rejeicao.append(
+            "estabilidade %.1f%% < mínimo %.1f%%"
+            % (estabilidade_atual, estabilidade_minima)
+        )
+
+    valido = all(filtros.values())
 
     return {
         "valido": bool(valido),
         "cor": escolha,
-        "probabilidade": float(
-            probs.get(escolha, 0.0)
-        ),
+        "probabilidade": prob_atual,
         "amostras": int(amostras),
         "configuracao": (
             "tempo-real %.0f%% / %d amostras"
@@ -1305,7 +1368,9 @@ def calcular_sinal_tempo_real():
             estabilidade_minima
         ),
         "data_hora_brasilia": agora_brasilia(),
-        "motor": "tempo_real_rapido"
+        "motor": "tempo_real_rapido",
+        "filtros": filtros,
+        "motivos_rejeicao": motivos_rejeicao
     }
 
 
@@ -1337,6 +1402,97 @@ def atualizar_sinal_tempo_real(rodada_base=None):
     sinal = dict(
         sinal or {"valido": False}
     )
+
+    recebido_epoch = 0.0
+    try:
+        recebido_epoch = float(
+            rodada_base.get("recebido_epoch", 0.0) or 0.0
+        )
+    except Exception:
+        recebido_epoch = 0.0
+
+    fonte_epoch = 0.0
+    try:
+        fonte_dt = _parse_iso_utc_para_datetime(
+            rodada_base.get("timestamp_fonte", "")
+        )
+        fonte_epoch = (
+            fonte_dt.timestamp()
+            if fonte_dt is not None
+            else 0.0
+        )
+    except Exception:
+        fonte_epoch = 0.0
+
+    atraso_fonte_servidor = None
+    if recebido_epoch > 0 and fonte_epoch > 0:
+        atraso_fonte_servidor = max(
+            0.0,
+            recebido_epoch - fonte_epoch
+        )
+
+    idade_total_sinal = None
+    if recebido_epoch > 0:
+        idade_total_sinal = max(
+            0.0,
+            time.time() - recebido_epoch
+        )
+
+    max_atraso = limite_atraso_fonte_servidor()
+    max_idade = limite_idade_sinal()
+
+    frescor_ok = True
+    motivos_latencia = []
+
+    if (
+        atraso_fonte_servidor is not None
+        and atraso_fonte_servidor > max_atraso
+    ):
+        frescor_ok = False
+        motivos_latencia.append(
+            "atraso fonte→servidor %.3fs > limite %.3fs"
+            % (
+                atraso_fonte_servidor,
+                max_atraso
+            )
+        )
+
+    if (
+        idade_total_sinal is not None
+        and idade_total_sinal > max_idade
+    ):
+        frescor_ok = False
+        motivos_latencia.append(
+            "sinal ficou velho: %.3fs > limite %.3fs"
+            % (
+                idade_total_sinal,
+                max_idade
+            )
+        )
+
+    if not frescor_ok:
+        sinal["valido"] = False
+
+    motivos_existentes = list(
+        sinal.get("motivos_rejeicao", []) or []
+    )
+    motivos_existentes.extend(motivos_latencia)
+
+    sinal["motivos_rejeicao"] = motivos_existentes
+    sinal["frescor_ok"] = bool(frescor_ok)
+    sinal["atraso_fonte_servidor_segundos"] = (
+        round(atraso_fonte_servidor, 3)
+        if atraso_fonte_servidor is not None
+        else None
+    )
+    sinal["idade_total_sinal_segundos"] = (
+        round(idade_total_sinal, 3)
+        if idade_total_sinal is not None
+        else None
+    )
+    sinal["limite_atraso_fonte_servidor_segundos"] = max_atraso
+    sinal["limite_idade_sinal_segundos"] = max_idade
+
     sinal["base_rodada_id"] = base_id
     sinal["base_data_hora"] = base_data_hora
     sinal["gerado_em_brasilia"] = gerado_em
@@ -3063,6 +3219,34 @@ def status_tempo_real():
     ultimas_live = live[-20:]
 
     intervalo_ultimas_live_s = None
+    atraso_fonte_servidor_s = None
+
+    if ultimas_live:
+        ultima_live = ultimas_live[-1]
+        try:
+            recebido_epoch_ultima = float(
+                ultima_live.get("recebido_epoch", 0.0) or 0.0
+            )
+        except Exception:
+            recebido_epoch_ultima = 0.0
+
+        try:
+            fonte_dt_ultima = _parse_iso_utc_para_datetime(
+                ultima_live.get("timestamp_fonte", "")
+            )
+            fonte_epoch_ultima = (
+                fonte_dt_ultima.timestamp()
+                if fonte_dt_ultima
+                else 0.0
+            )
+        except Exception:
+            fonte_epoch_ultima = 0.0
+
+        if recebido_epoch_ultima > 0 and fonte_epoch_ultima > 0:
+            atraso_fonte_servidor_s = (
+                recebido_epoch_ultima - fonte_epoch_ultima
+            )
+
     if len(ultimas_live) >= 2:
         try:
             intervalo_ultimas_live_s = max(
@@ -3083,7 +3267,7 @@ def status_tempo_real():
 
     return {
         "ok": True,
-        "versao": "V53.3",
+        "versao": "V53.5",
         "modo": "tempo_real_websocket",
         "ws_online": snapshot["ws_online"],
         "ws_saudavel": saudavel,
@@ -3112,6 +3296,7 @@ def status_tempo_real():
         "analise_pendente_id": snapshot["analise_pendente_id"],
         "analise_iniciada_em": snapshot["analise_iniciada_em"],
         "intervalo_ultimas_live_segundos": intervalo_ultimas_live_s,
+        "atraso_fonte_servidor_segundos": atraso_fonte_servidor_s,
         "ultima_rodada_live": (
             ultimas_live[-1] if ultimas_live else None
         ),
@@ -3125,7 +3310,7 @@ def painel_tempo_real_html():
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Double — Tempo Real V53.3</title>
+<title>Double — Tempo Real V53.5</title>
 <style>
 *{box-sizing:border-box}
 body{font-family:Arial,sans-serif;background:#0d0f12;color:#f1f1f1;margin:0;padding:14px}
@@ -3146,7 +3331,7 @@ h1{font-size:25px;margin:8px 0 14px}
 </style>
 </head>
 <body>
-<h1>Double — Tempo Real V53.3</h1>
+<h1>Double — Tempo Real V53.5</h1>
 
 <div class="card">
   <div id="health">Carregando...</div>
@@ -3216,19 +3401,29 @@ async function atualizar(){
         ' | Concordância: '+(s.concordancia_modelos??'-')+'/'+(s.total_modelos??'-');
     }else{
       document.getElementById('signalMain').textContent='SEM ENTRADA';
+      const motivos=(s.motivos_rejeicao||[]);
+      const frescorTxt = s.frescor_ok===false
+        ? ' | BLOQUEADO POR LATÊNCIA'
+        : '';
       document.getElementById('signalDetail').textContent=
         'ANÁLISE ATUALIZADA PARA A PRÓXIMA RODADA | Base: '+(d.sinal_base_data_hora||'-')+
         ' | Gerado: '+(d.sinal_gerado_em||'-')+
         ' | Candidato estatístico: '+nomeCor(s.cor)+
-        ' | filtros de segurança não aprovaram a entrada.';
+        frescorTxt+
+        ' | Motivo(s): '+(motivos.length?motivos.join(' ; '):'filtros de segurança não aprovaram a entrada');
     }
 
     const intervaloLive = d.intervalo_ultimas_live_segundos==null
       ? '-'
       : Number(d.intervalo_ultimas_live_segundos).toFixed(1)+' s';
 
+    const atrasoFonte = d.atraso_fonte_servidor_segundos==null
+      ? '-'
+      : Number(d.atraso_fonte_servidor_segundos).toFixed(3)+' s';
+
     document.getElementById('quality').textContent=
       'Intervalo entre as 2 últimas capturas: '+intervaloLive+
+      ' | Atraso fonte→servidor: '+atrasoFonte+
       ' | Rolling recebidos: '+d.resultados_rolling_recebidos+
       ' | Adicionados: '+d.rodadas_adicionadas_ws+
       ' | Duplicadas: '+d.duplicadas_detectadas+
@@ -3239,7 +3434,7 @@ async function atualizar(){
     document.getElementById('rounds').innerHTML = rounds.length ? rounds.map(x=>
       '<div class="row"><span class="ball '+esc(x.cor)+'">'+esc(x.numero??nomeCor(x.cor)[0])+'</span>'+
       '<div><b>'+esc(nomeCor(x.cor))+'</b><div class="small">'+esc(x.id)+'</div></div>'+
-      '<div class="time">'+esc(x.recebido_em_brasilia||x.data_hora||'')+'</div></div>'
+      '<div class="time">Blaze: '+esc(x.data_hora||'-')+'<br>Servidor: '+esc(x.recebido_em_brasilia||'-')+'</div></div>'
     ).join('') : '<div class="small">Aguardando a primeira rodada ao vivo após este deploy...</div>';
   }catch(e){
     document.getElementById('health').innerHTML='<b class="bad">Erro ao atualizar: '+esc(e)+'</b>';
@@ -4128,166 +4323,5 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/status":
             with LOCK:
                 self.enviar_json(200, {
-                    "online": True,
-                    "rodadas": len(ESTADO["rodadas"]),
-                    "ultima_atualizacao": ESTADO.get("ultima_atualizacao", ""),
-                    "feed_configurado": bool(
-                        str(carregar_config().get("resultados_url", "")).strip()
-                        or os.getenv("RESULTADOS_URL", "").strip()
-                    ),
-                    "modo_fonte": str(carregar_config().get("modo_fonte", "json")),
-                    "fonte_online": bool(ESTADO.get("fonte_online", False)),
-                    "ultima_rodada_fonte": str(ESTADO.get("ultima_rodada_fonte", ""))
-                })
-            return
-
-        if self.path == "/sinal":
-            self.enviar_json(200, calcular_sinal())
-            return
-
-        if self.path == "/configuracao":
-            self.enviar_json(200, carregar_config())
-            return
-
-        self.enviar_json(404, {"erro": "rota não encontrada"})
-
-    def do_POST(self):
-        if not self.exigir_autorizacao():
-            return
-
-        if self.path == "/importar-historico":
-            try:
-                resultado = importar_historico_bestblaze()
-                self.enviar_json(200, {
-                    "ok": True,
-                    "resultado": resultado,
-                    "cores": resumo_cores_historico(1000),
-                    "sequencias": sequencias_cores(1000)
-                })
-            except Exception as exc:
-                self.enviar_json(500, {
-                    "ok": False,
-                    "erro": str(exc)
-                })
-            return
-
-        if self.path == "/atualizar-agora":
-            novas = buscar_feed()
-            self.enviar_json(200, {
-                "ok": True,
-                "novas_rodadas": int(novas),
-                "data_hora_brasilia": agora_brasilia()
-            })
-            return
-
-        if self.path == "/rodada":
-            obj = self.ler_json()
-            rodada = item_feed_para_rodada(obj)
-            if rodada is None:
-                self.enviar_json(400, {"erro": "rodada inválida"})
-                return
-
-            nova = adicionar_rodada(rodada)
-            self.enviar_json(200, {"ok": True, "nova": nova})
-            return
-
-        if self.path == "/teste-notificacao":
-            sinal_teste = {
-                "valido": True,
-                "cor": "B",
-                "probabilidade": 0.65,
-                "amostras": 100,
-                "configuracao": "teste do servidor 24h",
-                "data_hora_brasilia": agora_brasilia()
-            }
-            enviado = enviar_ntfy(sinal_teste)
-            self.enviar_json(200, {
-                "ok": bool(enviado),
-                "mensagem": "notificação enviada" if enviado else "notificação não configurada ou falhou"
-            })
-            return
-
-        if self.path == "/configuracao":
-            obj = self.ler_json()
-            if not isinstance(obj, dict):
-                self.enviar_json(400, {"erro": "configuração inválida"})
-                return
-
-            cfg = carregar_config()
-            permitidas = {
-                "sinal_minimo",
-                "amostras_minimas",
-                "modo_adaptativo",
-                "limites_testados",
-                "amostras_testadas",
-                "janela_recente",
-                "janela_longa",
-                "resultados_url",
-                "modo_fonte",
-                "intervalo_segundos",
-                "ntfy_server",
-                "ntfy_topic",
-                "geracao_automatica",
-                "intervalo_notificacao_minutos",
-                "concordancia_minima",
-                "estabilidade_minima"
-            }
-
-            for chave, valor in obj.items():
-                if chave in permitidas:
-                    cfg[chave] = valor
-
-            salvar_json(CONFIG, cfg)
-            atualizar_sinal_e_notificar()
-            self.enviar_json(200, {"ok": True, "configuracao": cfg})
-            return
-
-        self.enviar_json(404, {"erro": "rota não encontrada"})
-
-    def log_message(self, format, *args):
-        print("[%s] %s" % (agora_brasilia(), format % args))
-
-
-def main():
-    carregar_estado()
-
-    if postgres_configurado():
-        postgres_inicializar()
-
-    if not CONFIG.exists():
-        salvar_json(CONFIG, CONFIG_PADRAO)
-
-    porta = int(os.getenv("PORT", os.getenv("PORTA", "8787")))
-
-    thread_sinal = threading.Thread(
-        target=recalcular_sinal_inicial,
-        daemon=True
-    )
-    thread_sinal.start()
-
-    thread_analise = threading.Thread(
-        target=worker_analise_sinal,
-        daemon=True
-    )
-    thread_analise.start()
-
-    thread = threading.Thread(
-        target=worker_feed,
-        daemon=True
-    )
-    thread.start()
-
-    thread_ws = threading.Thread(
-        target=worker_websocket_double,
-        daemon=True
-    )
-    thread_ws.start()
-
-    servidor = ThreadingHTTPServer(("0.0.0.0", porta), Handler)
-    print("Servidor 24h iniciado na porta", porta)
-    print("Horário de Brasília:", agora_brasilia())
-    servidor.serve_forever()
-
-
-if __name__ == "__main__":
-    main()
+               
+Prévia truncada devido ao tamanho do arquivo
