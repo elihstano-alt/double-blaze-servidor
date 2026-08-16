@@ -773,64 +773,66 @@ def adicionar_rodada(rodada):
 
 def extrair_bestblaze_historico_html(html):
     """
-    Parser histórico BestBlaze baseado na estrutura pública verificada:
+    Parser robusto do histórico público BestBlaze.
 
-      NUMERO
-      DD/MM/AAAA HH:MM:SS
+    A página apresenta a sequência:
+      número (quando não é branco)
+      data/hora
 
-    Quando um timestamp aparece sem número imediatamente antes, ele é tratado
-    como branco (W/0).
+    Quando aparece data/hora sem um número 0..14 imediatamente antes,
+    a rodada é branca (W). Textos como títulos, totais e contadores são
+    ignorados.
     """
     texto = html_para_texto(html)
 
-    timestamp_re = re.compile(
-        r"\b\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2}\b"
+    token_re = re.compile(
+        r"(?<!\d)(?:0|[1-9]|1[0-4])(?!\d)"
+        r"|"
+        r"\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2}"
     )
 
-    par_re = re.compile(
-        r"(?<!\d)(0|[1-9]|1[0-4])\s+"
-        r"(\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2})"
-    )
-
-    pares = {}
-    for numero_texto, data_hora in par_re.findall(texto):
-        try:
-            numero = int(numero_texto)
-        except Exception:
-            continue
-        pares[data_hora] = numero
-
-    todos_horarios = []
-    vistos_horarios = set()
-
-    for data_hora in timestamp_re.findall(texto):
-        if data_hora in vistos_horarios:
-            continue
-        vistos_horarios.add(data_hora)
-        todos_horarios.append(data_hora)
-
+    tokens = token_re.findall(texto)
     rodadas = []
+    vistos = set()
+    numero_pendente = None
 
-    for data_hora in todos_horarios:
-        try:
-            momento = datetime.strptime(data_hora, "%d/%m/%Y %H:%M:%S")
-        except Exception:
+    for token in tokens:
+        if re.fullmatch(r"0|[1-9]|1[0-4]", token):
+            numero_pendente = int(token)
             continue
 
-        if data_hora in pares:
-            numero = int(pares[data_hora])
-            cor = normalizar_cor(numero)
-        else:
+        # Timestamp.
+        data_hora = token
+
+        try:
+            momento = datetime.strptime(
+                data_hora,
+                "%d/%m/%Y %H:%M:%S"
+            )
+        except Exception:
+            numero_pendente = None
+            continue
+
+        if data_hora in vistos:
+            numero_pendente = None
+            continue
+
+        vistos.add(data_hora)
+
+        if numero_pendente is None:
             numero = 0
             cor = "W"
+        else:
+            numero = numero_pendente
+            cor = normalizar_cor(numero)
 
-        identificador = "%s-%02d" % (
-            momento.strftime("%Y%m%d-%H%M%S"),
-            numero
-        )
+        numero_pendente = None
 
         rodadas.append({
-            "id": identificador,
+            "id": "%s-%02d" % (
+                momento.strftime("%Y%m%d-%H%M%S"),
+                numero
+            ),
             "numero": numero,
             "cor": cor,
             "data_hora": data_hora,
@@ -844,28 +846,6 @@ def extrair_bestblaze_historico_html(html):
         )
     )
     return rodadas
-
-
-
-def _atributo_html(attrs, nome, padrao=""):
-    """
-    Lê atributo HTML simples sem depender de bibliotecas externas.
-    """
-    m = re.search(
-        r"(?is)\b" + re.escape(nome) + r"\s*=\s*([\"'])(.*?)\1",
-        attrs
-    )
-    if m:
-        return unescape(m.group(2)).strip()
-
-    m = re.search(
-        r"(?is)\b" + re.escape(nome) + r"\s*=\s*([^\s>]+)",
-        attrs
-    )
-    if m:
-        return unescape(m.group(1)).strip()
-
-    return padrao
 
 
 def detectar_formulario_periodo_bestblaze(html, base_url):
@@ -1068,12 +1048,17 @@ def diagnosticar_sessao_periodo_bestblaze():
 
     rodadas = extrair_bestblaze_historico_html(html)
 
+    texto_resposta = html_para_texto(html)
+
     return {
         "ok": True,
         "rodadas_reconhecidas": len(rodadas),
         "brancos_reconhecidos": sum(
             1 for item in rodadas if item.get("cor") == "W"
         ),
+        "tamanho_html": len(html),
+        "tem_texto_total_rodadas": "Total de rodadas" in texto_resposta,
+        "amostra_resposta": texto_resposta[:500],
         "sessao": diag,
         "campos_enviados": sorted(list(payload.keys()))
     }
@@ -1098,6 +1083,12 @@ def importar_1000_bestblaze(meta=1000):
         ultimo_payload = payload
 
         rodadas = extrair_bestblaze_historico_html(html)
+
+        if not rodadas:
+            raise RuntimeError(
+                "Consulta do período retornou HTTP 200, mas sem rodadas. "
+                "Use /diagnostico-periodo para ver a amostra da resposta."
+            )
 
         resultado = adicionar_rodadas_em_lote(rodadas)
         adicionadas = int(resultado.get("adicionadas", 0))
@@ -1545,7 +1536,7 @@ class Handler(BaseHTTPRequestHandler):
 
             self.enviar_json(200, {
                 "ok": True,
-                "versao": "V36",
+                "versao": "V37",
                 "fonte_online": fonte_online,
                 "rodadas": len(banco),
                 "vermelhos": sum(
