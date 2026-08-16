@@ -193,14 +193,13 @@ def html_para_texto(html):
 
 def extrair_bestblaze_html(html):
     """
-    Extrai as rodadas da página pública /doubleRodadasDia.
+    Extrai rodadas da página pública BestBlaze /doubleRodadasDia.
 
-    Estrutura observada:
+    Formato atual observado:
       DD/MM/AAAA HH:MM:SS
       NUMERO
 
-    Algumas linhas de horário podem aparecer sem número; nesses casos a rodada
-    é ignorada para evitar associação errada com o resultado seguinte.
+    Se houver horário sem número logo depois, a entrada é ignorada.
     """
     texto = html_para_texto(html)
 
@@ -246,16 +245,45 @@ def extrair_bestblaze_html(html):
     return rodadas
 
 def buscar_html_publico(url):
-    req = Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Mobile Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.7",
-            "Cache-Control": "no-cache"
-        }
-    )
-    return urlopen(req, timeout=20).read().decode("utf-8", errors="replace")
+    urls = [url]
+
+    # Fallback entre www e sem www.
+    if "://www.bestblaze.com.br/" in url:
+        urls.append(url.replace("://www.bestblaze.com.br/", "://bestblaze.com.br/"))
+    elif "://bestblaze.com.br/" in url:
+        urls.append(url.replace("://bestblaze.com.br/", "://www.bestblaze.com.br/"))
+
+    ultimo_erro = None
+
+    for tentativa in urls:
+        try:
+            req = Request(
+                tentativa,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Mobile Safari/537.36",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.7",
+                    "Cache-Control": "no-cache",
+                    "Pragma": "no-cache"
+                }
+            )
+            resposta = urlopen(req, timeout=25)
+            status = getattr(resposta, "status", 200)
+
+            if status < 200 or status >= 300:
+                raise RuntimeError("HTTP %s ao consultar BestBlaze" % status)
+
+            corpo = resposta.read().decode("utf-8", errors="replace")
+
+            if not corpo.strip():
+                raise RuntimeError("BestBlaze respondeu conteúdo vazio")
+
+            return corpo
+
+        except Exception as exc:
+            ultimo_erro = exc
+
+    raise RuntimeError("Falha ao consultar BestBlaze: %s" % ultimo_erro)
 
 def extrair_lista_feed(obj):
     if isinstance(obj, list):
@@ -701,9 +729,6 @@ def buscar_feed():
     url = str(cfg.get("resultados_url", "")).strip() or os.getenv("RESULTADOS_URL", "").strip()
     modo_fonte = str(cfg.get("modo_fonte", "json")).strip()
 
-    if modo_fonte == "bestblaze_html" and "bestblaze.com.br" in url.lower():
-        url = "https://www.bestblaze.com.br/doubleRodadasDia"
-
     with LOCK:
         ESTADO["ultima_consulta_fonte"] = agora_brasilia()
 
@@ -716,8 +741,12 @@ def buscar_feed():
 
     try:
         if modo_fonte == "bestblaze_html":
+            url = "https://www.bestblaze.com.br/doubleRodadasDia"
             raw_html = buscar_html_publico(url)
             items = extrair_bestblaze_html(raw_html)
+
+            if not items:
+                raise RuntimeError("BestBlaze respondeu, mas nenhuma rodada foi reconhecida no HTML")
         else:
             req = Request(url, headers={"User-Agent": "DoubleBlazeIA/1.0"})
             raw = urlopen(req, timeout=15).read().decode("utf-8")
@@ -801,6 +830,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if not self.exigir_autorizacao():
+            return
+
+        if self.path == "/":
+            self.enviar_json(200, {
+                "online": True,
+                "servico": "Double Blaze IA 24h",
+                "rotas": ["/status", "/diagnostico", "/fonte-status", "/historico", "/sinal"]
+            })
             return
 
         if self.path == "/diagnostico":
