@@ -235,6 +235,89 @@ def extrair_bestblaze_html(html):
     return rodadas
 
 
+
+def extrair_bestblaze_brancos_html(html):
+    """
+    Extrai os brancos da página pública /doubleBrancosDia.
+
+    Nessa página, cada timestamp listado representa diretamente uma rodada
+    branca. O número é armazenado como 0 apenas como metadado.
+    """
+    texto = html_para_texto(html)
+    datas = re.findall(
+        r"\b\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2}\b",
+        texto
+    )
+
+    rodadas = []
+    vistos = set()
+
+    for data_hora in datas:
+        try:
+            momento = datetime.strptime(data_hora, "%d/%m/%Y %H:%M:%S")
+        except Exception:
+            continue
+
+        identificador = "%s-%02d" % (
+            momento.strftime("%Y%m%d-%H%M%S"),
+            0
+        )
+
+        if identificador in vistos:
+            continue
+
+        vistos.add(identificador)
+        rodadas.append({
+            "id": identificador,
+            "numero": 0,
+            "cor": "W",
+            "data_hora": data_hora,
+            "origem": "bestblaze_brancos"
+        })
+
+    rodadas.sort(
+        key=lambda item: datetime.strptime(
+            item["data_hora"],
+            "%d/%m/%Y %H:%M:%S"
+        )
+    )
+    return rodadas
+
+
+def mesclar_rodadas_por_horario(*listas):
+    """
+    Mescla listas de rodadas sem duplicar o mesmo timestamp.
+    Se um timestamp constar na página de brancos, o branco tem prioridade.
+    """
+    mapa = {}
+
+    for lista in listas:
+        for item in lista or []:
+            if not isinstance(item, dict):
+                continue
+
+            horario = str(item.get("data_hora", "")).strip()
+            if not horario:
+                continue
+
+            anterior = mapa.get(horario)
+
+            # Branco confirmado pela página específica tem prioridade.
+            if anterior is None or str(item.get("cor", "")) == "W":
+                mapa[horario] = item
+
+    def chave(item):
+        try:
+            return datetime.strptime(
+                str(item.get("data_hora", "")),
+                "%d/%m/%Y %H:%M:%S"
+            )
+        except Exception:
+            return datetime.min
+
+    return sorted(mapa.values(), key=chave)
+
+
 def buscar_html_publico(url):
     req = Request(
         url,
@@ -757,6 +840,11 @@ def adicionar_rodadas_em_lote(rodadas_novas):
             for item in ESTADO.get("rodadas", [])
             if isinstance(item, dict) and str(item.get("id", ""))
         )
+        horarios_existentes = set(
+            str(item.get("data_hora", "")).strip()
+            for item in ESTADO.get("rodadas", [])
+            if isinstance(item, dict) and str(item.get("data_hora", "")).strip()
+        )
 
         banco = ESTADO.setdefault("rodadas", [])
 
@@ -766,7 +854,12 @@ def adicionar_rodadas_em_lote(rodadas_novas):
 
             identificador = str(rodada.get("id", ""))
 
-            if identificador and identificador in existentes:
+            horario = str(rodada.get("data_hora", "")).strip()
+
+            if (
+                (identificador and identificador in existentes)
+                or (horario and horario in horarios_existentes)
+            ):
                 duplicadas += 1
                 continue
 
@@ -779,8 +872,19 @@ def adicionar_rodadas_em_lote(rodadas_novas):
 
             if identificador:
                 existentes.add(identificador)
+            if horario:
+                horarios_existentes.add(horario)
 
-        banco.sort(key=lambda item: str(item.get("data_hora", "")))
+        def chave_banco(item):
+            try:
+                return datetime.strptime(
+                    str(item.get("data_hora", "")),
+                    "%d/%m/%Y %H:%M:%S"
+                )
+            except Exception:
+                return datetime.min
+
+        banco.sort(key=chave_banco)
 
         if len(banco) > 50000:
             del banco[:-50000]
@@ -807,7 +911,21 @@ def importar_historico_bestblaze(url=None):
         url = "https://bestblaze.com.br/doubleRodadas"
 
     html = buscar_html_publico(url)
-    rodadas = extrair_bestblaze_historico_html(html)
+    rodadas_normais = extrair_bestblaze_historico_html(html)
+
+    rodadas_brancas = []
+    try:
+        html_brancos = buscar_html_publico(
+            "https://bestblaze.com.br/doubleBrancosDia"
+        )
+        rodadas_brancas = extrair_bestblaze_brancos_html(html_brancos)
+    except Exception as exc_brancos:
+        print("Aviso na importação de brancos:", exc_brancos)
+
+    rodadas = mesclar_rodadas_por_horario(
+        rodadas_normais,
+        rodadas_brancas
+    )
 
     if not rodadas:
         raise RuntimeError(
@@ -952,7 +1070,23 @@ def buscar_feed():
     try:
         if modo_fonte == "bestblaze_html":
             raw_html = buscar_html_publico(url)
-            items = extrair_bestblaze_html(raw_html)
+            items_normais = extrair_bestblaze_html(raw_html)
+
+            # Complementa a fonte principal com a página dedicada aos brancos.
+            # Se a página de brancos falhar, o coletor principal continua vivo.
+            items_brancos = []
+            try:
+                html_brancos = buscar_html_publico(
+                    "https://bestblaze.com.br/doubleBrancosDia"
+                )
+                items_brancos = extrair_bestblaze_brancos_html(html_brancos)
+            except Exception as exc_brancos:
+                print("Aviso ao consultar brancos:", exc_brancos)
+
+            items = mesclar_rodadas_por_horario(
+                items_normais,
+                items_brancos
+            )
         else:
             req = Request(url, headers={"User-Agent": "DoubleBlazeIA/1.0"})
             raw = urlopen(req, timeout=15).read().decode("utf-8")
@@ -1048,6 +1182,39 @@ class Handler(BaseHTTPRequestHandler):
                     "resultado": resultado,
                     "cores": resumo_cores_historico(1000),
                     "sequencias": sequencias_cores(1000)
+                })
+            except Exception as exc:
+                self.enviar_json(500, {
+                    "ok": False,
+                    "erro": str(exc)
+                })
+            return
+
+        if self.path == "/diagnostico-brancos":
+            try:
+                html_brancos = buscar_html_publico(
+                    "https://bestblaze.com.br/doubleBrancosDia"
+                )
+                brancos = extrair_bestblaze_brancos_html(html_brancos)
+
+                with LOCK:
+                    brancos_banco = sum(
+                        1
+                        for item in ESTADO.get("rodadas", [])
+                        if isinstance(item, dict)
+                        and str(item.get("cor", "")) == "W"
+                    )
+
+                self.enviar_json(200, {
+                    "ok": True,
+                    "brancos_encontrados_na_fonte": len(brancos),
+                    "brancos_no_banco": brancos_banco,
+                    "primeiro_branco_fonte": (
+                        brancos[0].get("data_hora", "") if brancos else ""
+                    ),
+                    "ultimo_branco_fonte": (
+                        brancos[-1].get("data_hora", "") if brancos else ""
+                    )
                 })
             except Exception as exc:
                 self.enviar_json(500, {
