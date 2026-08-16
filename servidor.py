@@ -2268,49 +2268,34 @@ def _rodada_payload_ws(payload):
 
 
 def processar_mensagem_ws(msg):
-    """
-    Processa uma mensagem Socket.IO/Engine.IO e adiciona rodada apenas
-    quando houver evento double.tick com status rolling.
-    """
     if not isinstance(msg, str):
-        return {
-            "evento": False,
-            "adicionada": False
-        }
+        return {"evento": False, "adicionada": False}
 
-    if "double.tick" not in msg:
-        return {
-            "evento": False,
-            "adicionada": False
-        }
-
-    inicio = msg.find("[")
-    if inicio < 0:
-        return {
-            "evento": True,
-            "adicionada": False,
-            "erro": "JSON do evento não encontrado"
-        }
+    match = re.match(r'^\d+\["data",\s*({.*})\]$', msg)
+    if not match:
+        return {"evento": False, "adicionada": False}
 
     try:
-        obj = json.loads(msg[inicio:])
+        envelope = json.loads(match.group(1))
     except Exception as exc:
         return {
-            "evento": True,
+            "evento": False,
             "adicionada": False,
             "erro": "JSON inválido: %s" % exc
         }
 
-    payload = None
+    if not isinstance(envelope, dict):
+        return {"evento": False, "adicionada": False}
 
-    if isinstance(obj, list) and len(obj) >= 2:
-        segundo = obj[1]
+    evento_id = str(envelope.get("id", ""))
+    payload = envelope.get("payload")
 
-        if isinstance(segundo, dict):
-            payload = segundo.get(
-                "payload",
-                segundo
-            )
+    if evento_id != "double.tick":
+        return {
+            "evento": False,
+            "adicionada": False,
+            "id": evento_id
+        }
 
     if not isinstance(payload, dict):
         return {
@@ -2320,47 +2305,32 @@ def processar_mensagem_ws(msg):
         }
 
     with LOCK:
-        ESTADO["ws_eventos_recebidos"] = (
-            int(
-                ESTADO.get(
-                    "ws_eventos_recebidos",
-                    0
-                )
-            ) + 1
-        )
+        ESTADO["ws_eventos_recebidos"] = int(
+            ESTADO.get("ws_eventos_recebidos", 0)
+        ) + 1
         ESTADO["ws_ultimo_evento"] = agora_brasilia()
 
     _registrar_latencia_ws(payload)
-
     rodada = _rodada_payload_ws(payload)
 
     if rodada is None:
         return {
             "evento": True,
             "adicionada": False,
-            "status": str(
-                payload.get("status", "")
-            )
+            "status": str(payload.get("status", ""))
         }
 
     adicionada = adicionar_rodada(rodada)
 
     if adicionada:
         with LOCK:
-            ESTADO["ws_rodadas_adicionadas"] = (
-                int(
-                    ESTADO.get(
-                        "ws_rodadas_adicionadas",
-                        0
-                    )
-                ) + 1
-            )
+            ESTADO["ws_rodadas_adicionadas"] = int(
+                ESTADO.get("ws_rodadas_adicionadas", 0)
+            ) + 1
             ESTADO["ws_ultima_rodada"] = str(
                 rodada.get("data_hora", "")
             )
-            ESTADO["coletor_ultimo_modo"] = (
-                "websocket"
-            )
+            ESTADO["coletor_ultimo_modo"] = "websocket"
 
     return {
         "evento": True,
@@ -2370,202 +2340,103 @@ def processar_mensagem_ws(msg):
 
 
 def worker_websocket_double():
-    """
-    Coletor WebSocket de baixa latência.
-
-    Endpoint principal atualizado conforme implementação pública recente:
-      wss://api-gaming.blaze.bet.br/replication/?EIO=3&transport=websocket
-
-    Endpoint antigo fica apenas como fallback.
-
-    A assinatura é reenviada após o pacote de handshake Engine.IO ('0...'),
-    porque alguns servidores aceitam a conexão WebSocket antes de a sessão
-    Socket.IO estar pronta para inscrição.
-    """
     if websocket is None:
         with LOCK:
             ESTADO["ws_online"] = False
-            ESTADO["ws_ultimo_erro"] = (
-                "websocket-client não instalado"
-            )
+            ESTADO["ws_ultimo_erro"] = "websocket-client não instalado"
         return
 
-    endpoints = [
-        (
-            "wss://api-gaming.blaze.bet.br"
-            "/replication/?EIO=3&transport=websocket"
-        ),
-        (
-            "wss://api-v2.blaze.bet.br"
-            "/replication/?EIO=3&transport=websocket"
-        ),
-        (
-            "wss://api-v2.blaze.com"
-            "/replication/?EIO=3&transport=websocket"
-        )
-    ]
-
+    url = (
+        "wss://api-gaming.blaze.bet.br"
+        "/replication/?EIO=3&transport=websocket"
+    )
     assinatura = (
-        '421["cmd", {"id": "subscribe", '
-        '"payload": {"room": "double_v2"}}]'
+        '420["cmd",{"id":"subscribe",'
+        '"payload":{"room":"double_room_1"}}]'
     )
 
-    def enviar_assinatura(ws):
+    while True:
         try:
-            ws.send(assinatura)
-
             with LOCK:
-                ESTADO["ws_assinaturas_enviadas"] = (
-                    int(
-                        ESTADO.get(
-                            "ws_assinaturas_enviadas",
-                            0
-                        )
-                    ) + 1
-                )
+                ESTADO["ws_endpoint_atual"] = url
+                ESTADO["ws_online"] = False
+                ESTADO["ws_handshake_recebido"] = False
+                ESTADO["ws_ultimo_erro"] = ""
 
-            return True
+            def on_open(ws):
+                with LOCK:
+                    ESTADO["ws_online"] = True
+                    ESTADO["ws_ultimo_erro"] = ""
+                    ESTADO["ws_assinaturas_enviadas"] = int(
+                        ESTADO.get("ws_assinaturas_enviadas", 0)
+                    ) + 1
+                ws.send(assinatura)
+
+            def on_message(ws, msg):
+                with LOCK:
+                    ESTADO["ws_mensagens_raw"] = int(
+                        ESTADO.get("ws_mensagens_raw", 0)
+                    ) + 1
+                    texto = msg if isinstance(msg, str) else repr(msg)
+                    ESTADO["ws_ultimo_raw"] = texto[:500]
+
+                if isinstance(msg, str) and msg.startswith("0"):
+                    with LOCK:
+                        ESTADO["ws_handshake_recebido"] = True
+                    return
+
+                if msg == "2":
+                    try:
+                        ws.send("3")
+                    except Exception:
+                        pass
+                    return
+
+                processar_mensagem_ws(msg)
+
+            def on_error(ws, erro):
+                with LOCK:
+                    ESTADO["ws_online"] = False
+                    ESTADO["ws_ultimo_erro"] = str(erro)
+
+            def on_close(ws, codigo, motivo):
+                with LOCK:
+                    ESTADO["ws_online"] = False
+                    ESTADO["ws_ultimo_erro"] = (
+                        "fechado %s %s" % (codigo, motivo)
+                    )
+
+            app = websocket.WebSocketApp(
+                url,
+                on_open=on_open,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close,
+                header=[
+                    "Upgrade: websocket",
+                    "Pragma: no-cache",
+                    "Connection: Upgrade",
+                    "Accept-Encoding: gzip, deflate, br",
+                    "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/102.0.0.0 Safari/537.36"
+                ]
+            )
+
+            app.run_forever(
+                ping_interval=10,
+                ping_timeout=5,
+                ping_payload="2",
+                origin="https://api-gaming.blaze.com",
+                host="api-v2.blaze1.space"
+            )
 
         except Exception as exc:
             with LOCK:
-                ESTADO["ws_ultimo_erro"] = (
-                    "erro ao assinar: %s" % exc
-                )
-            return False
+                ESTADO["ws_online"] = False
+                ESTADO["ws_ultimo_erro"] = str(exc)
 
-    while True:
-        conectou_algum = False
-
-        for url in endpoints:
-            try:
-                with LOCK:
-                    ESTADO["ws_endpoint_atual"] = url
-                    ESTADO["ws_online"] = False
-                    ESTADO["ws_handshake_recebido"] = False
-                    ESTADO["ws_ultimo_erro"] = ""
-
-                def on_open(ws):
-                    with LOCK:
-                        ESTADO["ws_online"] = True
-                        ESTADO["ws_ultimo_erro"] = ""
-
-                    # Primeira tentativa imediata.
-                    enviar_assinatura(ws)
-
-                def on_message(ws, msg):
-                    with LOCK:
-                        ESTADO["ws_mensagens_raw"] = (
-                            int(
-                                ESTADO.get(
-                                    "ws_mensagens_raw",
-                                    0
-                                )
-                            ) + 1
-                        )
-
-                        texto = (
-                            msg
-                            if isinstance(msg, str)
-                            else repr(msg)
-                        )
-
-                        ESTADO["ws_ultimo_raw"] = texto[:500]
-
-                    # Engine.IO open packet. Após isso a sessão está pronta.
-                    if (
-                        isinstance(msg, str)
-                        and msg.startswith("0")
-                    ):
-                        with LOCK:
-                            ESTADO["ws_handshake_recebido"] = True
-
-                        # Reassina após o handshake.
-                        enviar_assinatura(ws)
-                        return
-
-                    # Engine.IO ping textual.
-                    if msg == "2":
-                        try:
-                            ws.send("3")
-                        except Exception:
-                            pass
-                        return
-
-                    # Processa double.tick quando aparecer.
-                    processar_mensagem_ws(msg)
-
-                def on_pong(ws, msg):
-                    pass
-
-                def on_error(ws, erro):
-                    with LOCK:
-                        ESTADO["ws_online"] = False
-                        ESTADO["ws_ultimo_erro"] = str(erro)
-
-                def on_close(ws, codigo, motivo):
-                    with LOCK:
-                        ESTADO["ws_online"] = False
-
-                        if motivo:
-                            ESTADO["ws_ultimo_erro"] = (
-                                "fechado %s %s" % (
-                                    codigo,
-                                    motivo
-                                )
-                            )
-
-                host = (
-                    url.split("://", 1)[1]
-                    .split("/", 1)[0]
-                )
-
-                app = websocket.WebSocketApp(
-                    url,
-                    on_open=on_open,
-                    on_message=on_message,
-                    on_error=on_error,
-                    on_close=on_close,
-                    on_pong=on_pong,
-                    header=[
-                        "User-Agent: Mozilla/5.0 "
-                        "(Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) "
-                        "Chrome/126.0 Safari/537.36"
-                    ]
-                )
-
-                conectou_algum = True
-
-                app.run_forever(
-                    ping_interval=24,
-                    ping_timeout=5,
-                    ping_payload="2",
-                    origin="https://blaze.bet.br",
-                    host=host
-                )
-
-            except Exception as exc:
-                with LOCK:
-                    ESTADO["ws_online"] = False
-                    ESTADO["ws_ultimo_erro"] = str(exc)
-
-            # Se recebemos qualquer tráfego raw neste endpoint,
-            # esperamos antes de alternar para outro.
-            with LOCK:
-                recebeu = int(
-                    ESTADO.get("ws_mensagens_raw", 0)
-                ) > 0
-
-            if recebeu:
-                break
-
-            time.sleep(2)
-
-        if not conectou_algum:
-            time.sleep(5)
-        else:
-            time.sleep(2)
+        time.sleep(2)
 
 
 def diagnostico_websocket():
@@ -2597,6 +2468,9 @@ def diagnostico_websocket():
             "endpoint_atual": str(
                 ESTADO.get("ws_endpoint_atual", "")
             ),
+            "sala": "double_room_1",
+            "pacote_assinatura": "420",
+            "formato_evento": "data -> id=double.tick",
             "handshake_recebido": bool(
                 ESTADO.get(
                     "ws_handshake_recebido",
@@ -3003,7 +2877,7 @@ class Handler(BaseHTTPRequestHandler):
 
             self.enviar_json(200, {
                 "ok": True,
-                "versao": "V49",
+                "versao": "V50",
                 "fonte_online": fonte_online,
                 "rodadas": len(banco),
                 "vermelhos": sum(
