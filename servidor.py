@@ -17,9 +17,10 @@ NTFY_TOPIC=seu_topico_privado
 """
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.request import Request, urlopen
+from urllib.request import Request, urlopen, build_opener, HTTPCookieProcessor
 from urllib.error import URLError, HTTPError
-from urllib.parse import urlencode, urljoin
+from http.cookiejar import CookieJar
+from urllib.parse import urlencode, urljoin, urlparse
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import json
@@ -845,49 +846,58 @@ def extrair_bestblaze_historico_html(html):
     return rodadas
 
 
-def detectar_formulario_periodo_bestblaze(html, base_url):
-    forms = re.findall(
-        r"(?is)<form\b([^>]*)>(.*?)</form>",
-        html
+
+def _atributo_html(attrs, nome, padrao=""):
+    """
+    Lê atributo HTML simples sem depender de bibliotecas externas.
+    """
+    m = re.search(
+        r"(?is)\b" + re.escape(nome) + r"\s*=\s*([\"'])(.*?)\1",
+        attrs
     )
+    if m:
+        return unescape(m.group(2)).strip()
+
+    m = re.search(
+        r"(?is)\b" + re.escape(nome) + r"\s*=\s*([^\s>]+)",
+        attrs
+    )
+    if m:
+        return unescape(m.group(1)).strip()
+
+    return padrao
+
+
+def detectar_formulario_periodo_bestblaze(html, base_url):
+    """
+    Detecta o formulário real de filtro, incluindo campos ocultos/CSRF.
+    """
+    forms = re.findall(r"(?is)<form\b([^>]*)>(.*?)</form>", html)
 
     for attrs, corpo in forms:
         inputs = re.findall(r"(?is)<input\b([^>]*)>", corpo)
+
         campos_data = []
+        ocultos = {}
 
         for attrs_input in inputs:
-            tipo_m = re.search(
-                r"(?i)\btype\s*=\s*[\"']?([^\"'\s>]+)",
-                attrs_input
-            )
-            nome_m = re.search(
-                r"(?i)\bname\s*=\s*[\"']?([^\"'\s>]+)",
-                attrs_input
-            )
+            tipo = _atributo_html(attrs_input, "type", "text").lower()
+            nome = _atributo_html(attrs_input, "name", "")
+            valor = _atributo_html(attrs_input, "value", "")
 
-            if not nome_m:
+            if not nome:
                 continue
-
-            tipo = tipo_m.group(1).lower() if tipo_m else "text"
-            nome = nome_m.group(1)
 
             if tipo in ("date", "datetime-local"):
                 campos_data.append((nome, tipo))
+            elif tipo == "hidden":
+                ocultos[nome] = valor
 
         if len(campos_data) < 2:
             continue
 
-        method_m = re.search(
-            r"(?i)\bmethod\s*=\s*[\"']?([^\"'\s>]+)",
-            attrs
-        )
-        action_m = re.search(
-            r"(?i)\baction\s*=\s*[\"']?([^\"'\s>]+)",
-            attrs
-        )
-
-        metodo = method_m.group(1).upper() if method_m else "GET"
-        action = action_m.group(1) if action_m else base_url
+        metodo = _atributo_html(attrs, "method", "GET").upper()
+        action = _atributo_html(attrs, "action", base_url)
 
         return {
             "method": metodo,
@@ -895,15 +905,86 @@ def detectar_formulario_periodo_bestblaze(html, base_url):
             "campo_inicial": campos_data[0][0],
             "tipo_inicial": campos_data[0][1],
             "campo_final": campos_data[1][0],
-            "tipo_final": campos_data[1][1]
+            "tipo_final": campos_data[1][1],
+            "ocultos": ocultos,
+            "nomes_ocultos": sorted(list(ocultos.keys()))
         }
 
     return None
 
 
+def _headers_bestblaze(referer=""):
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Linux; Android 15) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0 Mobile Safari/537.36"
+        ),
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "image/avif,image/webp,*/*;q=0.8"
+        ),
+        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.7",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Upgrade-Insecure-Requests": "1"
+    }
+
+    if referer:
+        headers["Referer"] = referer
+
+    return headers
+
+
+def criar_sessao_bestblaze():
+    """
+    Cria uma sessão HTTP real, preservando cookies entre GET e POST.
+    """
+    jar = CookieJar()
+    opener = build_opener(HTTPCookieProcessor(jar))
+    return opener, jar
+
+
+def abrir_com_sessao_bestblaze(opener, url, data=None, referer=""):
+    headers = _headers_bestblaze(referer)
+
+    if data is not None:
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+        parsed = urlparse(url)
+        headers["Origin"] = "%s://%s" % (parsed.scheme, parsed.netloc)
+
+    req = Request(
+        url,
+        data=data,
+        headers=headers,
+        method="POST" if data is not None else "GET"
+    )
+
+    resposta = opener.open(req, timeout=40)
+    status = getattr(resposta, "status", 200)
+    corpo = resposta.read().decode("utf-8", errors="replace")
+
+    if status < 200 or status >= 400:
+        raise RuntimeError("HTTP %s ao consultar período" % status)
+
+    return corpo, status
+
+
 def buscar_periodo_bestblaze(data_inicial, data_final):
+    """
+    Fluxo completo:
+    1. GET inicial para obter cookie de sessão e token/campos ocultos.
+    2. Detecta os nomes reais dos campos de data.
+    3. Reenvia o formulário na MESMA sessão.
+    """
     base_url = "https://bestblaze.com.br/doubleRodadas"
-    pagina_inicial = buscar_html_publico(base_url)
+    opener, jar = criar_sessao_bestblaze()
+
+    pagina_inicial, status_get = abrir_com_sessao_bestblaze(
+        opener,
+        base_url
+    )
+
     form = detectar_formulario_periodo_bestblaze(
         pagina_inicial,
         base_url
@@ -911,7 +992,7 @@ def buscar_periodo_bestblaze(data_inicial, data_final):
 
     if not form:
         raise RuntimeError(
-            "Não foi possível identificar automaticamente o formulário de período da BestBlaze"
+            "Formulário de período não identificado no HTML atual"
         )
 
     def formatar_data(dt, tipo):
@@ -919,53 +1000,83 @@ def buscar_periodo_bestblaze(data_inicial, data_final):
             return dt.strftime("%Y-%m-%dT%H:%M")
         return dt.strftime("%Y-%m-%d")
 
-    payload = {
-        form["campo_inicial"]: formatar_data(
-            data_inicial,
-            form["tipo_inicial"]
-        ),
-        form["campo_final"]: formatar_data(
-            data_final,
-            form["tipo_final"]
-        )
-    }
+    payload = dict(form.get("ocultos", {}))
+    payload[form["campo_inicial"]] = formatar_data(
+        data_inicial,
+        form["tipo_inicial"]
+    )
+    payload[form["campo_final"]] = formatar_data(
+        data_final,
+        form["tipo_final"]
+    )
 
-    encoded = urlencode(payload)
-
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Linux; Android 15) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/131.0 Mobile Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.7",
-        "Cache-Control": "no-cache"
-    }
+    encoded = urlencode(payload).encode("utf-8")
 
     if form["method"] == "POST":
-        req = Request(
+        html, status_post = abrir_com_sessao_bestblaze(
+            opener,
             form["action"],
-            data=encoded.encode("utf-8"),
-            headers={
-                **headers,
-                "Content-Type": "application/x-www-form-urlencoded"
-            }
+            data=encoded,
+            referer=base_url
         )
-        html = urlopen(req, timeout=35).read().decode(
-            "utf-8",
-            errors="replace"
-        )
+        url_final = form["action"]
     else:
         separador = "&" if "?" in form["action"] else "?"
-        url = form["action"] + separador + encoded
-        req = Request(url, headers=headers)
-        html = urlopen(req, timeout=35).read().decode(
-            "utf-8",
-            errors="replace"
+        url_final = form["action"] + separador + encoded.decode("utf-8")
+        html, status_post = abrir_com_sessao_bestblaze(
+            opener,
+            url_final,
+            referer=base_url
         )
 
-    return html, form, payload
+    cookies = []
+    for cookie in jar:
+        cookies.append({
+            "nome": cookie.name,
+            "dominio": cookie.domain,
+            "seguro": bool(cookie.secure)
+        })
+
+    diagnostico = {
+        "status_get": status_get,
+        "status_envio": status_post,
+        "metodo": form["method"],
+        "action": form["action"],
+        "campo_inicial": form["campo_inicial"],
+        "campo_final": form["campo_final"],
+        "campos_ocultos": form.get("nomes_ocultos", []),
+        "cookies_recebidos": cookies,
+        "url_final": url_final
+    }
+
+    return html, form, payload, diagnostico
+
+
+def diagnosticar_sessao_periodo_bestblaze():
+    """
+    Diagnóstico sem efetuar importação grande.
+    Valida cookie/token e consulta o dia atual.
+    """
+    agora = datetime.now(timezone(timedelta(hours=-3)))
+    inicio = agora.replace(hour=0, minute=0, second=0, microsecond=0)
+    fim = agora
+
+    html, form, payload, diag = buscar_periodo_bestblaze(
+        inicio,
+        fim
+    )
+
+    rodadas = extrair_bestblaze_historico_html(html)
+
+    return {
+        "ok": True,
+        "rodadas_reconhecidas": len(rodadas),
+        "brancos_reconhecidos": sum(
+            1 for item in rodadas if item.get("cor") == "W"
+        ),
+        "sessao": diag,
+        "campos_enviados": sorted(list(payload.keys()))
+    }
 
 
 def importar_1000_bestblaze(meta=1000):
@@ -982,7 +1093,7 @@ def importar_1000_bestblaze(meta=1000):
         inicio = alvo.replace(hour=0, minute=0, second=0, microsecond=0)
         fim = alvo.replace(hour=23, minute=59, second=59, microsecond=0)
 
-        html, form, payload = buscar_periodo_bestblaze(inicio, fim)
+        html, form, payload, diag_periodo = buscar_periodo_bestblaze(inicio, fim)
         ultimo_form = form
         ultimo_payload = payload
 
@@ -996,7 +1107,14 @@ def importar_1000_bestblaze(meta=1000):
             "data": alvo.strftime("%d/%m/%Y"),
             "recebidas": len(rodadas),
             "adicionadas": adicionadas,
-            "duplicadas": int(resultado.get("duplicadas", 0))
+            "duplicadas": int(resultado.get("duplicadas", 0)),
+            "status_http": int(diag_periodo.get("status_envio", 0)),
+            "metodo": str(diag_periodo.get("metodo", "")),
+            "campos_ocultos": list(diag_periodo.get("campos_ocultos", [])),
+            "cookies": [
+                c.get("nome", "")
+                for c in diag_periodo.get("cookies_recebidos", [])
+            ]
         })
 
         with LOCK:
@@ -1416,6 +1534,37 @@ class Handler(BaseHTTPRequestHandler):
                 })
             return
 
+        if self.path == "/saude-v36":
+            cfg = carregar_config()
+            with LOCK:
+                banco = list(ESTADO.get("rodadas", []))
+                fonte_online = bool(ESTADO.get("fonte_online", False))
+                ultima_atualizacao = str(
+                    ESTADO.get("ultima_atualizacao", "")
+                )
+
+            self.enviar_json(200, {
+                "ok": True,
+                "versao": "V36",
+                "fonte_online": fonte_online,
+                "rodadas": len(banco),
+                "vermelhos": sum(
+                    1 for x in banco
+                    if isinstance(x, dict) and x.get("cor") == "R"
+                ),
+                "pretos": sum(
+                    1 for x in banco
+                    if isinstance(x, dict) and x.get("cor") == "B"
+                ),
+                "brancos": sum(
+                    1 for x in banco
+                    if isinstance(x, dict) and x.get("cor") == "W"
+                ),
+                "ultima_atualizacao": ultima_atualizacao,
+                "modo_fonte": str(cfg.get("modo_fonte", "json"))
+            })
+            return
+
         if self.path == "/diagnostico-brancos":
             try:
                 html_brancos = buscar_html_publico(
@@ -1451,15 +1600,13 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path == "/diagnostico-periodo":
             try:
-                base_url = "https://bestblaze.com.br/doubleRodadas"
-                html = buscar_html_publico(base_url)
-                form = detectar_formulario_periodo_bestblaze(
-                    html,
-                    base_url
-                )
-                self.enviar_json(200, {
-                    "ok": bool(form),
-                    "formulario": form
+                resultado = diagnosticar_sessao_periodo_bestblaze()
+                self.enviar_json(200, resultado)
+            except HTTPError as exc:
+                self.enviar_json(500, {
+                    "ok": False,
+                    "erro": "HTTP %s" % getattr(exc, "code", "?"),
+                    "detalhe": str(exc)
                 })
             except Exception as exc:
                 self.enviar_json(500, {
