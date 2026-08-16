@@ -36,6 +36,11 @@ try:
 except Exception:
     psycopg = None
 
+try:
+    import websocket
+except Exception:
+    websocket = None
+
 BASE = Path(__file__).resolve().parent
 BANCO = BASE / "banco_servidor.json"
 CONFIG = BASE / "configuracao_servidor.json"
@@ -66,7 +71,16 @@ ESTADO = {
     "coletor_fallback_ultimo": "",
     "coletor_fallback_adicionadas": 0,
     "coletor_ultimo_modo": "",
-    "coletor_ultimo_erro": ""
+    "coletor_ultimo_erro": "",
+    "ws_online": False,
+    "ws_ultimo_evento": "",
+    "ws_ultima_rodada": "",
+    "ws_ultimo_erro": "",
+    "ws_eventos_recebidos": 0,
+    "ws_rodadas_adicionadas": 0,
+    "ws_latencia_segundos": None,
+    "ws_latencia_media_segundos": None,
+    "ws_latencias_recentes": []
 }
 
 CONFIG_PADRAO = {
@@ -2097,6 +2111,386 @@ def backtest_cor_simples(cor="R", limite=1000):
 
 
 
+def websocket_disponivel():
+    return websocket is not None
+
+
+def _parse_iso_utc_para_datetime(valor):
+    if not valor:
+        return None
+
+    s = str(valor).strip()
+
+    formatos = (
+        "%Y-%m-%dT%H:%M:%S.%fZ",
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%dT%H:%M:%S.%f%z",
+        "%Y-%m-%dT%H:%M:%S%z"
+    )
+
+    for fmt in formatos:
+        try:
+            dt = datetime.strptime(s, fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            continue
+
+    return None
+
+
+def _registrar_latencia_ws(payload):
+    candidatos = (
+        payload.get("updated_at"),
+        payload.get("created_at"),
+        payload.get("rolled_at")
+    )
+
+    origem = None
+
+    for valor in candidatos:
+        origem = _parse_iso_utc_para_datetime(valor)
+        if origem is not None:
+            break
+
+    if origem is None:
+        return None
+
+    agora_utc = datetime.now(timezone.utc)
+    latencia = max(
+        0.0,
+        (agora_utc - origem).total_seconds()
+    )
+
+    with LOCK:
+        historico = ESTADO.setdefault(
+            "ws_latencias_recentes",
+            []
+        )
+        historico.append(latencia)
+
+        if len(historico) > 100:
+            del historico[:-100]
+
+        ESTADO["ws_latencia_segundos"] = latencia
+        ESTADO["ws_latencia_media_segundos"] = (
+            sum(historico) / len(historico)
+        )
+
+    return latencia
+
+
+def _cor_ws_para_rbW(valor):
+    try:
+        n = int(valor)
+    except Exception:
+        return ""
+
+    # Implementações públicas da Blaze usam:
+    # 0 branco, 1 vermelho, 2 preto.
+    if n == 0:
+        return "W"
+    if n == 1:
+        return "R"
+    if n == 2:
+        return "B"
+
+    return ""
+
+
+def _rodada_payload_ws(payload):
+    if not isinstance(payload, dict):
+        return None
+
+    status = str(
+        payload.get("status", "")
+    ).lower()
+
+    if status != "rolling":
+        return None
+
+    cor = _cor_ws_para_rbW(
+        payload.get("color")
+    )
+
+    if not cor:
+        return None
+
+    try:
+        numero = int(
+            payload.get("roll")
+        )
+    except Exception:
+        numero = None
+
+    stamp = (
+        payload.get("updated_at")
+        or payload.get("created_at")
+        or agora_brasilia()
+    )
+
+    dt_utc = _parse_iso_utc_para_datetime(stamp)
+
+    if dt_utc is not None:
+        brasilia = timezone(timedelta(hours=-3))
+        data_hora = dt_utc.astimezone(
+            brasilia
+        ).strftime("%d/%m/%Y %H:%M:%S")
+    else:
+        data_hora = agora_brasilia()
+
+    identificador = str(
+        payload.get("id")
+        or payload.get("uuid")
+        or (
+            data_hora.replace("/", "")
+            .replace(" ", "-")
+            .replace(":", "")
+            + "-%s" % (
+                numero if numero is not None else cor
+            )
+        )
+    )
+
+    return {
+        "id": identificador,
+        "numero": numero,
+        "cor": cor,
+        "data_hora": data_hora,
+        "origem": "blaze_websocket"
+    }
+
+
+def processar_mensagem_ws(msg):
+    """
+    Processa uma mensagem Socket.IO/Engine.IO e adiciona rodada apenas
+    quando houver evento double.tick com status rolling.
+    """
+    if not isinstance(msg, str):
+        return {
+            "evento": False,
+            "adicionada": False
+        }
+
+    if "double.tick" not in msg:
+        return {
+            "evento": False,
+            "adicionada": False
+        }
+
+    inicio = msg.find("[")
+    if inicio < 0:
+        return {
+            "evento": True,
+            "adicionada": False,
+            "erro": "JSON do evento não encontrado"
+        }
+
+    try:
+        obj = json.loads(msg[inicio:])
+    except Exception as exc:
+        return {
+            "evento": True,
+            "adicionada": False,
+            "erro": "JSON inválido: %s" % exc
+        }
+
+    payload = None
+
+    if isinstance(obj, list) and len(obj) >= 2:
+        segundo = obj[1]
+
+        if isinstance(segundo, dict):
+            payload = segundo.get(
+                "payload",
+                segundo
+            )
+
+    if not isinstance(payload, dict):
+        return {
+            "evento": True,
+            "adicionada": False,
+            "erro": "payload ausente"
+        }
+
+    with LOCK:
+        ESTADO["ws_eventos_recebidos"] = (
+            int(
+                ESTADO.get(
+                    "ws_eventos_recebidos",
+                    0
+                )
+            ) + 1
+        )
+        ESTADO["ws_ultimo_evento"] = agora_brasilia()
+
+    _registrar_latencia_ws(payload)
+
+    rodada = _rodada_payload_ws(payload)
+
+    if rodada is None:
+        return {
+            "evento": True,
+            "adicionada": False,
+            "status": str(
+                payload.get("status", "")
+            )
+        }
+
+    adicionada = adicionar_rodada(rodada)
+
+    if adicionada:
+        with LOCK:
+            ESTADO["ws_rodadas_adicionadas"] = (
+                int(
+                    ESTADO.get(
+                        "ws_rodadas_adicionadas",
+                        0
+                    )
+                ) + 1
+            )
+            ESTADO["ws_ultima_rodada"] = str(
+                rodada.get("data_hora", "")
+            )
+            ESTADO["coletor_ultimo_modo"] = (
+                "websocket"
+            )
+
+    return {
+        "evento": True,
+        "adicionada": bool(adicionada),
+        "rodada": rodada
+    }
+
+
+def worker_websocket_double():
+    """
+    Mantém uma conexão WebSocket com reconexão automática.
+
+    Endpoint e assinatura seguem implementação pública da comunidade:
+      wss://api-v2.blaze.com/replication/?EIO=3&transport=websocket
+      room double_v2
+      evento double.tick
+
+    O fallback histórico continua ativo caso a conexão falhe.
+    """
+    if websocket is None:
+        with LOCK:
+            ESTADO["ws_online"] = False
+            ESTADO["ws_ultimo_erro"] = (
+                "websocket-client não instalado"
+            )
+        return
+
+    url = (
+        "wss://api-v2.blaze.com"
+        "/replication/?EIO=3&transport=websocket"
+    )
+
+    while True:
+        try:
+            def on_open(ws):
+                assinatura = (
+                    '421["cmd",{"id":"subscribe",'
+                    '"payload":{"room":"double_v2"}}]'
+                )
+                ws.send(assinatura)
+
+                with LOCK:
+                    ESTADO["ws_online"] = True
+                    ESTADO["ws_ultimo_erro"] = ""
+
+            def on_message(ws, msg):
+                processar_mensagem_ws(msg)
+
+            def on_pong(ws, msg):
+                try:
+                    ws.send("2")
+                except Exception:
+                    pass
+
+            def on_error(ws, erro):
+                with LOCK:
+                    ESTADO["ws_online"] = False
+                    ESTADO["ws_ultimo_erro"] = str(erro)
+
+            def on_close(ws, codigo, motivo):
+                with LOCK:
+                    ESTADO["ws_online"] = False
+                    ESTADO["ws_ultimo_erro"] = (
+                        "fechado %s %s" % (
+                            codigo,
+                            motivo
+                        )
+                    )
+
+            app = websocket.WebSocketApp(
+                url,
+                on_open=on_open,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close,
+                on_pong=on_pong
+            )
+
+            app.run_forever(
+                ping_interval=24,
+                ping_timeout=5,
+                ping_payload="2",
+                origin="https://blaze.com",
+                host="api-v2.blaze.com"
+            )
+
+        except Exception as exc:
+            with LOCK:
+                ESTADO["ws_online"] = False
+                ESTADO["ws_ultimo_erro"] = str(exc)
+
+        time.sleep(2)
+
+
+def diagnostico_websocket():
+    with LOCK:
+        return {
+            "ok": True,
+            "driver_websocket": websocket_disponivel(),
+            "online": bool(
+                ESTADO.get("ws_online", False)
+            ),
+            "ultimo_evento": str(
+                ESTADO.get("ws_ultimo_evento", "")
+            ),
+            "ultima_rodada": str(
+                ESTADO.get("ws_ultima_rodada", "")
+            ),
+            "ultimo_erro": str(
+                ESTADO.get("ws_ultimo_erro", "")
+            ),
+            "eventos_recebidos": int(
+                ESTADO.get(
+                    "ws_eventos_recebidos",
+                    0
+                )
+            ),
+            "rodadas_adicionadas": int(
+                ESTADO.get(
+                    "ws_rodadas_adicionadas",
+                    0
+                )
+            ),
+            "latencia_segundos": ESTADO.get(
+                "ws_latencia_segundos"
+            ),
+            "latencia_media_segundos": ESTADO.get(
+                "ws_latencia_media_segundos"
+            ),
+            "total_memoria": len(
+                ESTADO.get("rodadas", [])
+            )
+        }
+
+
 def buscar_feed_fallback_bestblaze():
     """
     Fallback do coletor ao vivo.
@@ -2467,7 +2861,7 @@ class Handler(BaseHTTPRequestHandler):
 
             self.enviar_json(200, {
                 "ok": True,
-                "versao": "V47",
+                "versao": "V48",
                 "fonte_online": fonte_online,
                 "rodadas": len(banco),
                 "vermelhos": sum(
@@ -2568,6 +2962,13 @@ class Handler(BaseHTTPRequestHandler):
                     "ok": False,
                     "erro": str(exc)
                 })
+            return
+
+        if self.path == "/diagnostico-websocket":
+            self.enviar_json(
+                200,
+                diagnostico_websocket()
+            )
             return
 
         if self.path == "/diagnostico-coletor":
@@ -2981,8 +3382,17 @@ def main():
 
     porta = int(os.getenv("PORT", os.getenv("PORTA", "8787")))
 
-    thread = threading.Thread(target=worker_feed, daemon=True)
+    thread = threading.Thread(
+        target=worker_feed,
+        daemon=True
+    )
     thread.start()
+
+    thread_ws = threading.Thread(
+        target=worker_websocket_double,
+        daemon=True
+    )
+    thread_ws.start()
 
     servidor = ThreadingHTTPServer(("0.0.0.0", porta), Handler)
     print("Servidor 24h iniciado na porta", porta)
