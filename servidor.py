@@ -7266,19 +7266,36 @@ def buscar_feed_fallback_bestblaze():
             for item in ESTADO.get("rodadas", [])
             if isinstance(item, dict)
         }
-    novas = [
-        rodada for rodada in rodadas
-        if str(rodada.get("data_hora", "")).strip() not in horarios_existentes
-    ]
+    with LOCK:
+        ultimas_live = [
+            dict(item) for item in ESTADO.get("rodadas", [])[-500:]
+            if isinstance(item, dict)
+            and str(item.get("origem", "")) == "blaze_websocket"
+        ]
 
-    if len(novas) > 5:
-        resultado_lote = adicionar_rodadas_em_lote(novas)
-        adicionadas = int(resultado_lote.get("adicionadas", 0))
-    else:
-        adicionadas = 0
-        for rodada in novas:
-            if adicionar_rodada(rodada):
-                adicionadas += 1
+    novas = []
+    for rodada in rodadas:
+        horario = str(rodada.get("data_hora", "")).strip()
+        if horario in horarios_existentes:
+            continue
+
+        # BestBlaze costuma registrar o mesmo resultado cerca de 15 segundos
+        # antes do updated_at do WebSocket. Mesmo número/cor dentro de 20s é a
+        # mesma rodada, não uma rodada adicional.
+        momento = momento_efetivo_epoch(rodada)
+        duplicada_live = any(
+            int(item.get("numero", -1)) == int(rodada.get("numero", -2))
+            and abs(momento_efetivo_epoch(item) - momento) <= 20.0
+            for item in ultimas_live
+            if momento > 0 and momento_efetivo_epoch(item) > 0
+        )
+        if not duplicada_live:
+            novas.append(rodada)
+
+    # Sempre em lote, inclusive para uma única rodada. Assim o fallback nunca
+    # bloqueia o coletor com Demo/análise/persistência repetida item a item.
+    resultado_lote = adicionar_rodadas_em_lote(novas)
+    adicionadas = int(resultado_lote.get("adicionadas", 0))
 
     with LOCK:
         ESTADO["coletor_fallback_ultimo"] = agora_brasilia()
