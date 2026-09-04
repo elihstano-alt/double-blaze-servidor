@@ -34,6 +34,7 @@ import bisect
 import numpy as np
 from numba import njit
 from html import unescape
+from contextlib import contextmanager
 
 try:
     import psycopg
@@ -249,6 +250,9 @@ def postgres_driver_ok():
 
 _POSTGRES_POOL = None
 _POSTGRES_POOL_LOCK = threading.Lock()
+_POSTGRES_BACKOFF_LOCK = threading.Lock()
+_POSTGRES_BACKOFF_UNTIL = 0.0
+_POSTGRES_BACKOFF_ERROR = ""
 
 
 def _obter_pool_postgres():
@@ -267,7 +271,7 @@ def _obter_pool_postgres():
                 timeout=10,
                 max_idle=300,
                 max_lifetime=1800,
-                reconnect_timeout=30,
+                reconnect_timeout=5,
                 kwargs={
                     "connect_timeout": 5,
                     "prepare_threshold": None,
@@ -282,7 +286,15 @@ def _obter_pool_postgres():
     return _POSTGRES_POOL
 
 
+def postgres_em_backoff():
+    with _POSTGRES_BACKOFF_LOCK:
+        return time.time() < _POSTGRES_BACKOFF_UNTIL
+
+
+@contextmanager
 def conectar_postgres():
+    global _POSTGRES_BACKOFF_UNTIL, _POSTGRES_BACKOFF_ERROR
+
     if not postgres_configurado():
         raise RuntimeError("DATABASE_URL não configurada")
 
@@ -291,9 +303,38 @@ def conectar_postgres():
             "drivers psycopg/psycopg_pool não instalados; confira requirements.txt"
         )
 
-    # Retorna um contexto do pool. Os `with conectar_postgres()` existentes
-    # continuam válidos, mas a conexão volta ao pool em vez de ser recriada.
-    return _obter_pool_postgres().connection(timeout=10)
+    with _POSTGRES_BACKOFF_LOCK:
+        restante = _POSTGRES_BACKOFF_UNTIL - time.time()
+        erro_anterior = _POSTGRES_BACKOFF_ERROR
+    if restante > 0:
+        raise RuntimeError(
+            "PostgreSQL em espera segura por %.0fs%s" % (
+                restante,
+                (": " + erro_anterior) if erro_anterior else "",
+            )
+        )
+
+    try:
+        # A conexão volta ao pool em vez de ser recriada a cada rodada.
+        with _obter_pool_postgres().connection(timeout=7) as conn:
+            yield conn
+        with _POSTGRES_BACKOFF_LOCK:
+            _POSTGRES_BACKOFF_UNTIL = 0.0
+            _POSTGRES_BACKOFF_ERROR = ""
+    except Exception as exc:
+        mensagem = str(exc)
+        baixo = mensagem.lower()
+        if any(chave in baixo for chave in (
+            "ecircuitbreaker",
+            "authentication",
+            "password authentication",
+            "too many authentication failures",
+            "couldn't get a connection",
+        )):
+            with _POSTGRES_BACKOFF_LOCK:
+                _POSTGRES_BACKOFF_UNTIL = time.time() + 90.0
+                _POSTGRES_BACKOFF_ERROR = mensagem[:240]
+        raise
 
 
 def postgres_inicializar():
@@ -867,6 +908,74 @@ def sincronizar_memoria_postgres():
         resultado["total_memoria"] = len(snapshot)
 
     return resultado
+
+
+def worker_recuperacao_postgres():
+    """Reconecta após bloqueio temporário e mescla banco + memória sem perdas."""
+    time.sleep(20)
+    while True:
+        if postgres_em_backoff():
+            time.sleep(15)
+            continue
+
+        try:
+            rodadas_pg = postgres_carregar_rodadas(LIMITE_HISTORICO)
+            with LOCK:
+                memoria_antes = list(ESTADO.get("rodadas", []))
+
+            if rodadas_pg:
+                mapa = {}
+                for item in rodadas_pg + memoria_antes:
+                    if not isinstance(item, dict):
+                        continue
+                    horario = str(item.get("data_hora", "")).strip()
+                    ident = str(item.get("id", "")).strip()
+                    chave = horario or ident
+                    if not chave:
+                        continue
+                    anterior = mapa.get(chave)
+                    origem = str(item.get("origem", ""))
+                    if anterior is None or origem in (
+                        "blaze_websocket",
+                        "blaze_api_oficial",
+                    ):
+                        mapa[chave] = dict(item)
+
+                mescladas = ordenar_rodadas_canonicas(list(mapa.values()))
+                with LOCK:
+                    ESTADO["rodadas"] = mescladas
+                    ESTADO["ultima_atualizacao"] = agora_brasilia()
+                    ESTADO["recuperacao_postgres"] = {
+                        "status": "sincronizado",
+                        "em": agora_brasilia(),
+                        "carregadas_postgres": len(rodadas_pg),
+                        "memoria_antes": len(memoria_antes),
+                        "total_mesclado": len(mescladas),
+                        "erro": "",
+                    }
+                    salvar_json(BANCO, ESTADO)
+
+                # Persiste resultados recebidos enquanto o banco estava bloqueado.
+                if memoria_antes:
+                    postgres_salvar_rodadas(memoria_antes)
+
+                demos_pg = postgres_demo_carregar_todos()
+                if demos_pg:
+                    with LOCK:
+                        ESTADO["demo_contas"] = demos_pg
+
+                time.sleep(300)
+                continue
+
+        except Exception as exc:
+            with LOCK:
+                ESTADO["recuperacao_postgres"] = {
+                    "status": "aguardando_reconexao",
+                    "em": agora_brasilia(),
+                    "erro": str(exc)[:300],
+                }
+
+        time.sleep(30)
 
 
 def _epoch_brasilia(data_hora):
@@ -4270,7 +4379,10 @@ def adicionar_rodada(rodada):
     except Exception as exc:
         print("Erro ao processar Demo 24h:", exc, flush=True)
 
-    if str(rodada.get("origem", "")) == "blaze_websocket":
+    if str(rodada.get("origem", "")) in (
+        "blaze_websocket",
+        "blaze_api_oficial",
+    ):
         solicitar_recalculo_sinal(rodada)
     else:
         atualizar_sinal_e_notificar(rodada)
@@ -10674,6 +10786,13 @@ def main():
         name="blaze-api-oficial"
     )
     thread_api_oficial.start()
+
+    thread_postgres_recovery = threading.Thread(
+        target=worker_recuperacao_postgres,
+        daemon=True,
+        name="postgres-recovery"
+    )
+    thread_postgres_recovery.start()
 
     # V58.0: segunda camada independente do WebSocket.
     thread_reconciliacao = threading.Thread(
