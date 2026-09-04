@@ -329,7 +329,6 @@ def conectar_postgres():
             "authentication",
             "password authentication",
             "too many authentication failures",
-            "couldn't get a connection",
         )):
             with _POSTGRES_BACKOFF_LOCK:
                 _POSTGRES_BACKOFF_UNTIL = time.time() + 90.0
@@ -1126,6 +1125,9 @@ def websocket_tempo_real_saudavel(max_sem_rolling=90.0):
         ultima_adicionada = float(
             ESTADO.get("ws_ultima_adicionada_epoch", 0.0)
         )
+        ultimo_source = float(
+            ESTADO.get("ws_ultimo_source_epoch", 0.0)
+        )
 
     if not online or not handshake:
         return False
@@ -1134,8 +1136,13 @@ def websocket_tempo_real_saudavel(max_sem_rolling=90.0):
         return conectado > 0 and agora - conectado <= max_sem_rolling
 
     # Uma conexão que apenas repete o mesmo payload não é tempo real saudável.
-    # Exigimos uma rodada realmente nova aceita na base.
-    return agora - ultima_adicionada <= max_sem_rolling
+    # Exigimos uma rodada nova e timestamp da fonte próximo do relógio atual.
+    # Isso também detecta WebSocket que está reproduzindo resultados de horas atrás.
+    return bool(
+        agora - ultima_adicionada <= max_sem_rolling
+        and ultimo_source > 0
+        and abs(agora - ultimo_source) <= max_sem_rolling
+    )
 
 
 def recalcular_sinal_inicial():
@@ -4792,7 +4799,9 @@ def diagnosticar_sessao_periodo_bestblaze():
         fim
     )
 
-    rodadas = extrair_bestblaze_historico_html(html)
+    rodadas = ordenar_rodadas_canonicas(
+        extrair_bestblaze_historico_html(html)
+    )
 
     texto_resposta = html_para_texto(html)
 
@@ -5225,9 +5234,19 @@ def api_oficial_tempo_real_saudavel(max_idade=90.0):
 
 
 def fonte_tempo_real_saudavel(max_idade=90.0):
+    with LOCK:
+        html_online = bool(ESTADO.get("fonte_online", False))
+        html_ultima = str(ESTADO.get("ultima_rodada_fonte", ""))
+    html_epoch = _epoch_brasilia(html_ultima)
+    html_saudavel = bool(
+        html_online
+        and html_epoch > 0
+        and abs(time.time() - html_epoch) <= max(120.0, float(max_idade))
+    )
     return bool(
         websocket_tempo_real_saudavel(max_idade)
         or api_oficial_tempo_real_saudavel(max_idade)
+        or html_saudavel
     )
 
 
@@ -5464,7 +5483,12 @@ def _bestblaze_varrer_opcoes_dia(data_alvo, intervalos):
     candidatos = []
     diag = []
 
+    prazo_final = time.monotonic() + 180.0
+
     for valor in valores:
+        if time.monotonic() >= prazo_final:
+            diag.append({"interrompido": "prazo máximo de 180s atingido"})
+            break
         payload = dict(form.get("defaults", {}))
         payload[form["campo_inicial"]] = fd(inicio, form["tipo_inicial"])
         payload[form["campo_final"]] = fd(fim, form["tipo_final"])
@@ -5640,7 +5664,7 @@ def worker_reparo_inicial():
     lacunas com rodadas reais comprovadas pela fonte pública. Depois repete
     em baixa frequência para recuperar lacunas que a fonte volte a expor.
     """
-    if os.getenv("REPARO_LACUNAS_ATIVO", "1").strip().lower() in ("0", "false", "nao", "não", "off"):
+    if os.getenv("REPARO_LACUNAS_ATIVO", "0").strip().lower() in ("0", "false", "nao", "não", "off"):
         return
 
     with LOCK:
@@ -7128,43 +7152,55 @@ def buscar_feed_fallback_bestblaze():
     Se o formulário do site aceitar apenas 'date', o servidor pode retornar
     o dia inteiro; nesse caso limitamos localmente às últimas 40 rodadas.
     """
-    agora = datetime.now(
-        timezone(timedelta(hours=-3))
+    # A página do dia é pública, atualizada continuamente e não exige a
+    # consulta lenta do formulário histórico por hora.
+    html = buscar_html_publico(
+        "https://bestblaze.com.br/doubleRodadasDia"
     )
-    inicio = agora - timedelta(minutes=20)
-    fim = agora
-
-    html, form, payload, diag = buscar_periodo_bestblaze(
-        inicio,
-        fim
+    rodadas = ordenar_rodadas_canonicas(
+        extrair_bestblaze_historico_html(html)
     )
 
-    rodadas = extrair_bestblaze_historico_html(html)
+    # Na primeira recuperação usa o dia inteiro para fechar qualquer intervalo
+    # perdido. Depois, com poucas inéditas, segue o fluxo LIVE normal da Demo.
+    with LOCK:
+        horarios_existentes = {
+            str(item.get("data_hora", "")).strip()
+            for item in ESTADO.get("rodadas", [])
+            if isinstance(item, dict)
+        }
+    novas = [
+        rodada for rodada in rodadas
+        if str(rodada.get("data_hora", "")).strip() not in horarios_existentes
+    ]
 
-    # Segurança: nunca reprocessar uma página inteira no loop ao vivo.
-    rodadas = rodadas[-40:]
-
-    adicionadas = 0
-
-    for rodada in rodadas:
-        if adicionar_rodada(rodada):
-            adicionadas += 1
+    if len(novas) > 5:
+        resultado_lote = adicionar_rodadas_em_lote(novas)
+        adicionadas = int(resultado_lote.get("adicionadas", 0))
+    else:
+        adicionadas = 0
+        for rodada in novas:
+            if adicionar_rodada(rodada):
+                adicionadas += 1
 
     with LOCK:
         ESTADO["coletor_fallback_ultimo"] = agora_brasilia()
         ESTADO["coletor_fallback_adicionadas"] = adicionadas
         ESTADO["coletor_ultimo_modo"] = "fallback_bestblaze"
         ESTADO["coletor_ultimo_erro"] = ""
+        ESTADO["fonte_online"] = bool(rodadas)
+        ESTADO["ultima_consulta_fonte"] = agora_brasilia()
+        if rodadas:
+            ESTADO["ultima_rodada_fonte"] = str(
+                rodadas[-1].get("data_hora", "")
+            )
 
     return {
         "ok": True,
         "adicionadas": adicionadas,
         "reconhecidas": len(rodadas),
-        "status_get": int(diag.get("status_get", 0)),
-        "status_envio": int(diag.get("status_envio", 0)),
-        "tipo_filtro": str(
-            diag.get("tipo_filtro_enviado", "")
-        )
+        "ineditas": len(novas),
+        "fonte": "bestblaze_doubleRodadasDia"
     }
 
 
