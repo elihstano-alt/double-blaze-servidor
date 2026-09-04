@@ -37,8 +37,10 @@ from html import unescape
 
 try:
     import psycopg
+    from psycopg_pool import ConnectionPool
 except Exception:
     psycopg = None
+    ConnectionPool = None
 
 try:
     import websocket
@@ -242,25 +244,56 @@ def postgres_configurado():
 
 
 def postgres_driver_ok():
-    return psycopg is not None
+    return psycopg is not None and ConnectionPool is not None
+
+
+_POSTGRES_POOL = None
+_POSTGRES_POOL_LOCK = threading.Lock()
+
+
+def _obter_pool_postgres():
+    """Mantém poucas conexões reutilizáveis e evita autenticar a cada rodada."""
+    global _POSTGRES_POOL
+
+    if _POSTGRES_POOL is not None:
+        return _POSTGRES_POOL
+
+    with _POSTGRES_POOL_LOCK:
+        if _POSTGRES_POOL is None:
+            _POSTGRES_POOL = ConnectionPool(
+                conninfo=database_url(),
+                min_size=0,
+                max_size=2,
+                timeout=10,
+                max_idle=300,
+                max_lifetime=1800,
+                reconnect_timeout=30,
+                kwargs={
+                    "connect_timeout": 5,
+                    "prepare_threshold": None,
+                    "options": (
+                        "-c statement_timeout=8000 "
+                        "-c lock_timeout=3000"
+                    ),
+                },
+                open=True,
+            )
+
+    return _POSTGRES_POOL
 
 
 def conectar_postgres():
     if not postgres_configurado():
         raise RuntimeError("DATABASE_URL não configurada")
 
-    if psycopg is None:
+    if psycopg is None or ConnectionPool is None:
         raise RuntimeError(
-            "driver psycopg não instalado; confira requirements.txt"
+            "drivers psycopg/psycopg_pool não instalados; confira requirements.txt"
         )
 
-    # Supabase Transaction Pooler não suporta prepared statements.
-    return psycopg.connect(
-        database_url(),
-        connect_timeout=5,
-        prepare_threshold=None,
-        options="-c statement_timeout=8000 -c lock_timeout=3000"
-    )
+    # Retorna um contexto do pool. Os `with conectar_postgres()` existentes
+    # continuam válidos, mas a conexão volta ao pool em vez de ser recriada.
+    return _obter_pool_postgres().connection(timeout=10)
 
 
 def postgres_inicializar():
