@@ -1014,17 +1014,19 @@ def websocket_tempo_real_saudavel(max_sem_rolling=90.0):
         conectado = float(
             ESTADO.get("ws_conectado_epoch", 0.0)
         )
-        ultimo_rolling = float(
-            ESTADO.get("ws_ultimo_recebido_epoch", 0.0)
+        ultima_adicionada = float(
+            ESTADO.get("ws_ultima_adicionada_epoch", 0.0)
         )
 
     if not online or not handshake:
         return False
 
-    if ultimo_rolling <= 0:
+    if ultima_adicionada <= 0:
         return conectado > 0 and agora - conectado <= max_sem_rolling
 
-    return agora - ultimo_rolling <= max_sem_rolling
+    # Uma conexão que apenas repete o mesmo payload não é tempo real saudável.
+    # Exigimos uma rodada realmente nova aceita na base.
+    return agora - ultima_adicionada <= max_sem_rolling
 
 
 def recalcular_sinal_inicial():
@@ -5091,6 +5093,123 @@ def _http_json(url, timeout=18):
     return json.loads(raw), status
 
 
+BLAZE_RECENT_OFICIAL_URL = (
+    "https://blaze.bet.br/api/singleplayer-originals/"
+    "originals/roulette_games/recent/1"
+)
+
+
+def api_oficial_tempo_real_saudavel(max_idade=90.0):
+    with LOCK:
+        online = bool(ESTADO.get("api_oficial_online", False))
+        ultimo_epoch = float(
+            ESTADO.get("api_oficial_ultima_rodada_epoch", 0.0) or 0.0
+        )
+    return bool(
+        online
+        and ultimo_epoch > 0
+        and time.time() - ultimo_epoch <= float(max_idade)
+    )
+
+
+def fonte_tempo_real_saudavel(max_idade=90.0):
+    return bool(
+        websocket_tempo_real_saudavel(max_idade)
+        or api_oficial_tempo_real_saudavel(max_idade)
+    )
+
+
+def buscar_blaze_oficial_recente():
+    """Consulta a API oficial recente e guarda apenas rodadas reais inéditas."""
+    consulta_epoch = time.time()
+    try:
+        obj, status = _http_json(BLAZE_RECENT_OFICIAL_URL, timeout=15)
+        registros = _extrair_registros_json_blaze(obj)
+        rodadas = []
+        for item in registros:
+            rodada = _rodada_json_blaze(item)
+            if not rodada:
+                continue
+            rodada["origem"] = "blaze_api_oficial"
+            rodada["timestamp_fonte"] = str(
+                item.get("created_at")
+                or item.get("updated_at")
+                or item.get("rolled_at")
+                or ""
+            )
+            rodada["recebido_epoch"] = consulta_epoch
+            rodada["recebido_em_brasilia"] = datetime.fromtimestamp(
+                consulta_epoch,
+                timezone(timedelta(hours=-3))
+            ).strftime("%d/%m/%Y %H:%M:%S")
+            rodadas.append(rodada)
+
+        rodadas = ordenar_rodadas_canonicas(rodadas)
+        if not rodadas:
+            raise RuntimeError("API oficial respondeu sem rodadas válidas")
+
+        adicionadas = 0
+        for rodada in rodadas:
+            if adicionar_rodada(rodada):
+                adicionadas += 1
+
+        ultima = rodadas[-1]
+        ultimo_epoch = momento_efetivo_epoch(ultima)
+        with LOCK:
+            ESTADO["api_oficial_online"] = True
+            ESTADO["api_oficial_ultima_consulta"] = agora_brasilia()
+            ESTADO["api_oficial_ultima_rodada"] = str(
+                ultima.get("data_hora", "")
+            )
+            ESTADO["api_oficial_ultima_rodada_epoch"] = ultimo_epoch
+            ESTADO["api_oficial_ultimo_erro"] = ""
+            ESTADO["api_oficial_status_http"] = int(status)
+            ESTADO["fonte_online"] = bool(
+                ultimo_epoch > 0
+                and time.time() - ultimo_epoch <= 90.0
+            )
+            ESTADO["ultima_consulta_fonte"] = agora_brasilia()
+            ESTADO["ultima_rodada_fonte"] = str(
+                ultima.get("data_hora", "")
+            )
+            ESTADO["coletor_ultimo_modo"] = "blaze_api_oficial"
+
+        return {
+            "ok": True,
+            "status_http": int(status),
+            "recebidas": len(rodadas),
+            "adicionadas": adicionadas,
+            "ultima_rodada": str(ultima.get("data_hora", "")),
+        }
+    except Exception as exc:
+        with LOCK:
+            ESTADO["api_oficial_online"] = False
+            ESTADO["api_oficial_ultima_consulta"] = agora_brasilia()
+            ESTADO["api_oficial_ultimo_erro"] = str(exc)[:500]
+        return {"ok": False, "adicionadas": 0, "erro": str(exc)}
+
+
+def worker_api_oficial_recente():
+    """Camada principal de captura: polling leve da API oficial a cada 8s."""
+    while True:
+        resultado = buscar_blaze_oficial_recente()
+        if int(resultado.get("adicionadas", 0)) > 0:
+            print(
+                "API oficial Blaze: novas=",
+                resultado.get("adicionadas"),
+                "ultima=",
+                resultado.get("ultima_rodada", ""),
+                flush=True,
+            )
+        elif not resultado.get("ok"):
+            print(
+                "API oficial Blaze erro:",
+                resultado.get("erro", ""),
+                flush=True,
+            )
+        time.sleep(8)
+
+
 def _reparo_blaze_json_paginado(intervalos, max_paginas=260):
     """Tenta histórico paginado Blaze/compatível. Só devolve registros dentro das lacunas."""
     if not intervalos:
@@ -6226,6 +6345,7 @@ def processar_mensagem_ws(msg):
             ESTADO["ws_rodadas_adicionadas"] = int(
                 ESTADO.get("ws_rodadas_adicionadas", 0)
             ) + 1
+            ESTADO["ws_ultima_adicionada_epoch"] = recebido_epoch
             ESTADO["ws_ultima_rodada"] = str(
                 rodada.get("data_hora", "")
             )
@@ -6970,6 +7090,18 @@ def diagnostico_coletor():
             ),
             "total_memoria": len(
                 ESTADO.get("rodadas", [])
+            ),
+            "api_oficial_online": bool(
+                ESTADO.get("api_oficial_online", False)
+            ),
+            "api_oficial_ultima_consulta": str(
+                ESTADO.get("api_oficial_ultima_consulta", "")
+            ),
+            "api_oficial_ultima_rodada": str(
+                ESTADO.get("api_oficial_ultima_rodada", "")
+            ),
+            "api_oficial_ultimo_erro": str(
+                ESTADO.get("api_oficial_ultimo_erro", "")
             )
         }
 
@@ -6987,6 +7119,7 @@ def diagnostico_coletor():
         ),
         "fallback_apos_ciclos": 3,
         "fallback_intervalo_minimo_segundos": 60,
+        "tempo_real_saudavel": fonte_tempo_real_saudavel(),
         "estado": estado,
         "postgres": postgres_status()
     }
@@ -9676,9 +9809,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path == "/saude-v36":
             cfg = carregar_config()
+            fonte_online = fonte_tempo_real_saudavel()
             with LOCK:
                 banco = list(ESTADO.get("rodadas", []))
-                fonte_online = bool(ESTADO.get("fonte_online", False))
                 ultima_atualizacao = str(
                     ESTADO.get("ultima_atualizacao", "")
                 )
@@ -10087,11 +10220,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path == "/diagnostico":
             cfg = carregar_config()
+            fonte_online = fonte_tempo_real_saudavel()
 
             with LOCK:
                 sinais_registrados = len(ESTADO.get("historico_sinais", []))
                 rodadas = len(ESTADO.get("rodadas", []))
-                fonte_online = bool(ESTADO.get("fonte_online", False))
                 ultima_rodada = str(ESTADO.get("ultima_rodada_fonte", ""))
                 ultima_atualizacao = str(ESTADO.get("ultima_atualizacao", ""))
 
@@ -10211,10 +10344,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path == "/fonte-status":
             cfg = carregar_config()
+            fonte_online_atual = fonte_tempo_real_saudavel()
 
             with LOCK:
                 self.enviar_json(200, {
-                    "online": bool(ESTADO.get("fonte_online", False)),
+                    "online": fonte_online_atual,
                     "configurada": bool(
                         str(cfg.get("resultados_url", "")).strip()
                         or os.getenv("RESULTADOS_URL", "").strip()
@@ -10228,6 +10362,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/status":
+            fonte_online_atual = fonte_tempo_real_saudavel()
             with LOCK:
                 self.enviar_json(200, {
                     "online": True,
@@ -10237,8 +10372,8 @@ class Handler(BaseHTTPRequestHandler):
                         str(carregar_config().get("resultados_url", "")).strip()
                         or os.getenv("RESULTADOS_URL", "").strip()
                     ),
-                    "modo_fonte": str(carregar_config().get("modo_fonte", "json")),
-                    "fonte_online": bool(ESTADO.get("fonte_online", False)),
+                    "modo_fonte": str(ESTADO.get("coletor_ultimo_modo", carregar_config().get("modo_fonte", "json"))),
+                    "fonte_online": fonte_online_atual,
                     "ultima_rodada_fonte": str(ESTADO.get("ultima_rodada_fonte", ""))
                 })
             return
@@ -10530,6 +10665,15 @@ def main():
         daemon=True
     )
     thread_ws.start()
+
+    # Fonte oficial independente: impede que um WebSocket conectado, mas
+    # repetindo payload antigo, interrompa a captura de novas rodadas.
+    thread_api_oficial = threading.Thread(
+        target=worker_api_oficial_recente,
+        daemon=True,
+        name="blaze-api-oficial"
+    )
+    thread_api_oficial.start()
 
     # V58.0: segunda camada independente do WebSocket.
     thread_reconciliacao = threading.Thread(
