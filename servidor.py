@@ -5628,16 +5628,26 @@ def reparar_lacunas_reais_seguro(max_lacunas=500, max_dias=31):
 
         lacunas = lacunas_todas[-max_lacunas:]
         intervalos = [(float(g["de_epoch"]), float(g["ate_epoch"])) for g in lacunas if float(g.get("de_epoch", 0)) > 0 and float(g.get("ate_epoch", 0)) > float(g.get("de_epoch", 0))]
-        dias = []
-        for g in lacunas:
-            for campo in ("de", "ate"):
-                try:
-                    d = datetime.strptime(g[campo], "%d/%m/%Y %H:%M:%S").strftime("%Y-%m-%d")
-                    if d not in dias:
-                        dias.append(d)
-                except Exception:
-                    pass
-        dias = dias[-max_dias:]
+        # Inclui todos os dias atravessados por uma lacuna longa. A versão
+        # anterior consultava somente as duas pontas; numa ausência de vários
+        # dias, todo o miolo (25/08 a 02/09, por exemplo) era ignorado.
+        dias_set = set()
+        tz_brasilia = timezone(timedelta(hours=-3))
+        for de_epoch, ate_epoch in intervalos:
+            try:
+                inicio_dia = datetime.fromtimestamp(
+                    de_epoch, tz_brasilia
+                ).date()
+                fim_dia = datetime.fromtimestamp(
+                    ate_epoch, tz_brasilia
+                ).date()
+                cursor = inicio_dia
+                while cursor <= fim_dia:
+                    dias_set.add(cursor.strftime("%Y-%m-%d"))
+                    cursor += timedelta(days=1)
+            except Exception:
+                continue
+        dias = sorted(dias_set)[-max_dias:]
 
         with LOCK:
             ESTADO["reparo_lacunas"] = {"status": "executando", "etapa": "blaze_json_paginado", "lacunas_antes": int(antes.get("lacunas", 0)), "adicionadas": 0, "erro": ""}
