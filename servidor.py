@@ -67,6 +67,7 @@ ANALISE_EVENT = threading.Event()
 ANALISE_PENDENTE_LOCK = threading.Lock()
 ANALISE_PENDENTE_RODADA = None
 DEMO_RODADAS_QUEUE = queue.Queue(maxsize=5000)
+PERSISTENCIA_WS_QUEUE = queue.Queue(maxsize=10000)
 
 LIMITE_AVALIACOES_SHADOW = 500
 LIMITE_ENTRADAS_REGISTRADAS = 1000
@@ -4359,6 +4360,8 @@ def adicionar_rodada(rodada):
     if not rodada:
         return False
 
+    origem_live = str(rodada.get("origem", "")) == "blaze_websocket"
+
     with LOCK:
         rodadas = ESTADO["rodadas"]
 
@@ -4377,15 +4380,25 @@ def adicionar_rodada(rodada):
         rodadas[:] = ordenar_rodadas_canonicas(rodadas)
 
         ESTADO["ultima_atualizacao"] = agora_brasilia()
-        salvar_json(BANCO, ESTADO)
+        # Escrita de arquivo dentro do callback também bloqueava a leitura do
+        # próximo frame. Para WS, o worker abaixo salva memória + PostgreSQL.
+        if not origem_live:
+            salvar_json(BANCO, ESTADO)
 
-    if postgres_configurado():
+    if origem_live:
+        try:
+            PERSISTENCIA_WS_QUEUE.put_nowait(dict(rodada))
+        except queue.Full:
+            # A rodada continua preservada em memória e será mesclada pelo
+            # worker de recuperação PostgreSQL.
+            print("Fila PostgreSQL cheia; rodada mantida em memória", flush=True)
+    elif postgres_configurado():
         postgres_salvar_rodadas([rodada])
 
     # O callback do WebSocket precisa voltar imediatamente. Uma fila única
     # mantém a ordem das rodadas e impede dezenas de threads Demo de disputar
     # as duas conexões PostgreSQL disponíveis no plano gratuito.
-    if str(rodada.get("origem", "")) == "blaze_websocket":
+    if origem_live:
         try:
             DEMO_RODADAS_QUEUE.put_nowait(dict(rodada))
         except queue.Full:
@@ -4405,6 +4418,35 @@ def adicionar_rodada(rodada):
         atualizar_sinal_e_notificar(rodada)
 
     return True
+
+
+def worker_persistencia_ws():
+    """Persiste resultados WS em lote sem bloquear a conexão de captura."""
+    while True:
+        primeira = PERSISTENCIA_WS_QUEUE.get()
+        lote = [primeira]
+        while len(lote) < 100:
+            try:
+                lote.append(PERSISTENCIA_WS_QUEUE.get_nowait())
+            except queue.Empty:
+                break
+
+        try:
+            if postgres_configurado():
+                resultado = postgres_salvar_rodadas(lote)
+                if not resultado.get("ok"):
+                    print(
+                        "Persistência WS aguardando recuperação PostgreSQL:",
+                        resultado.get("erro", ""),
+                        flush=True
+                    )
+            with LOCK:
+                salvar_json(BANCO, ESTADO)
+        except Exception as exc:
+            print("Erro na persistência WS:", exc, flush=True)
+        finally:
+            for _ in lote:
+                PERSISTENCIA_WS_QUEUE.task_done()
 
 
 def worker_demo_rodadas_live():
@@ -10891,6 +10933,13 @@ def main():
         daemon=True
     )
     thread_reconciliacao.start()
+
+    thread_persistencia_live = threading.Thread(
+        target=worker_persistencia_ws,
+        daemon=True,
+        name="postgres-rodadas-live"
+    )
+    thread_persistencia_live.start()
 
     thread_demo_live = threading.Thread(
         target=worker_demo_rodadas_live,
