@@ -4380,11 +4380,24 @@ def adicionar_rodada(rodada):
     if postgres_configurado():
         postgres_salvar_rodadas([rodada])
 
-    # Processa todas as contas Demo no servidor, mesmo sem app conectado.
-    try:
-        processar_demos_com_rodada(rodada)
-    except Exception as exc:
-        print("Erro ao processar Demo 24h:", exc, flush=True)
+    # O callback do WebSocket precisa voltar imediatamente para continuar
+    # lendo a conexão. Demo/estratégias podem ser pesadas e, quando rodavam
+    # aqui, criavam uma fila crescente de eventos já antigos.
+    def _processar_demo_assincrono(item):
+        try:
+            processar_demos_com_rodada(item)
+        except Exception as exc:
+            print("Erro ao processar Demo 24h:", exc, flush=True)
+
+    if str(rodada.get("origem", "")) == "blaze_websocket":
+        threading.Thread(
+            target=_processar_demo_assincrono,
+            args=(dict(rodada),),
+            daemon=True,
+            name="demo-rodada-live"
+        ).start()
+    else:
+        _processar_demo_assincrono(rodada)
 
     if str(rodada.get("origem", "")) in (
         "blaze_websocket",
@@ -5038,7 +5051,8 @@ def adicionar_rodadas_em_lote(rodadas_novas):
         # A Demo recebe somente rodadas que chegam pelo fluxo LIVE em
         # adicionar_rodada(). Isso impede rodadas antigas de serem contabilizadas
         # depois de deploy, reparo, fallback ou importação.
-        atualizar_sinal_e_notificar()
+        if novas_adicionadas:
+            solicitar_recalculo_sinal(novas_adicionadas[-1])
 
     return {
         "recebidas": len(rodadas_novas),
@@ -6423,6 +6437,33 @@ def processar_mensagem_ws(msg):
     )
     source_epoch = source_dt.timestamp() if source_dt else 0.0
 
+    # Nunca grava como rodada ao vivo um evento que ficou represado na
+    # conexão. Ao detectar atraso, fecha o socket para uma nova assinatura
+    # começar no ponto atual. A reconciliação pública recupera qualquer item
+    # real que tenha ficado entre as duas conexões.
+    idade_fonte = (
+        recebido_epoch - source_epoch
+        if source_epoch > 0
+        else 0.0
+    )
+    if source_epoch > 0 and idade_fonte > 90.0:
+        with LOCK:
+            ESTADO["ws_stale_rejeitadas"] = int(
+                ESTADO.get("ws_stale_rejeitadas", 0)
+            ) + 1
+            ESTADO["ws_ultimo_source_epoch"] = source_epoch
+            ESTADO["ws_ultimo_recebido_epoch"] = recebido_epoch
+            ESTADO["ws_ultimo_recebido_brasilia"] = agora_brasilia()
+            ESTADO["ws_ultimo_erro"] = (
+                "evento atrasado rejeitado: %.1fs" % idade_fonte
+            )
+        return {
+            "evento": True,
+            "adicionada": False,
+            "stale": True,
+            "idade_fonte_segundos": round(idade_fonte, 3)
+        }
+
     with LOCK:
         ESTADO["ws_eventos_rolling_recebidos"] = int(
             ESTADO.get("ws_eventos_rolling_recebidos", 0)
@@ -6590,7 +6631,12 @@ def worker_websocket_double():
                         pass
                     return
 
-                processar_mensagem_ws(msg)
+                resultado = processar_mensagem_ws(msg)
+                if isinstance(resultado, dict) and resultado.get("stale"):
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
 
             def on_error(ws, erro):
                 heartbeat_stop.set()
