@@ -31,6 +31,7 @@ import time
 import re
 import hashlib
 import bisect
+import queue
 import numpy as np
 from numba import njit
 from html import unescape
@@ -65,6 +66,7 @@ META_CORTE_BASE = "v58_base_auditada_20260824"
 ANALISE_EVENT = threading.Event()
 ANALISE_PENDENTE_LOCK = threading.Lock()
 ANALISE_PENDENTE_RODADA = None
+DEMO_RODADAS_QUEUE = queue.Queue(maxsize=5000)
 
 LIMITE_AVALIACOES_SHADOW = 500
 LIMITE_ENTRADAS_REGISTRADAS = 1000
@@ -4380,24 +4382,19 @@ def adicionar_rodada(rodada):
     if postgres_configurado():
         postgres_salvar_rodadas([rodada])
 
-    # O callback do WebSocket precisa voltar imediatamente para continuar
-    # lendo a conexão. Demo/estratégias podem ser pesadas e, quando rodavam
-    # aqui, criavam uma fila crescente de eventos já antigos.
-    def _processar_demo_assincrono(item):
+    # O callback do WebSocket precisa voltar imediatamente. Uma fila única
+    # mantém a ordem das rodadas e impede dezenas de threads Demo de disputar
+    # as duas conexões PostgreSQL disponíveis no plano gratuito.
+    if str(rodada.get("origem", "")) == "blaze_websocket":
         try:
-            processar_demos_com_rodada(item)
+            DEMO_RODADAS_QUEUE.put_nowait(dict(rodada))
+        except queue.Full:
+            print("Fila Demo cheia; rodada preservada no histórico", flush=True)
+    else:
+        try:
+            processar_demos_com_rodada(rodada)
         except Exception as exc:
             print("Erro ao processar Demo 24h:", exc, flush=True)
-
-    if str(rodada.get("origem", "")) == "blaze_websocket":
-        threading.Thread(
-            target=_processar_demo_assincrono,
-            args=(dict(rodada),),
-            daemon=True,
-            name="demo-rodada-live"
-        ).start()
-    else:
-        _processar_demo_assincrono(rodada)
 
     if str(rodada.get("origem", "")) in (
         "blaze_websocket",
@@ -4408,6 +4405,18 @@ def adicionar_rodada(rodada):
         atualizar_sinal_e_notificar(rodada)
 
     return True
+
+
+def worker_demo_rodadas_live():
+    """Processa cada rodada live em ordem sem bloquear o WebSocket."""
+    while True:
+        rodada = DEMO_RODADAS_QUEUE.get()
+        try:
+            processar_demos_com_rodada(rodada)
+        except Exception as exc:
+            print("Erro ao processar Demo 24h:", exc, flush=True)
+        finally:
+            DEMO_RODADAS_QUEUE.task_done()
 
 
 
@@ -10882,6 +10891,13 @@ def main():
         daemon=True
     )
     thread_reconciliacao.start()
+
+    thread_demo_live = threading.Thread(
+        target=worker_demo_rodadas_live,
+        daemon=True,
+        name="demo-rodadas-live"
+    )
+    thread_demo_live.start()
 
     # V58.4: Demo 24h se auto-sincroniza mesmo após deploy/restart.
     thread_demo_sync = threading.Thread(
