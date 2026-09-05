@@ -15,7 +15,7 @@ MIGRATE_DEMO_URL=os.environ.get('MIGRATE_DEMO_URL','https://double-live-radar-eu
 
 DEMO_START=1000.0
 DEMO_BET=10.0
-DEMO_COUNT=5
+DEMO_COUNT=10
 DEMO_FILE='/tmp/double_live_demos_state.json'
 DEMO_LOCK=threading.RLock()
 DEMOS_STATE=None
@@ -131,8 +131,9 @@ def calc_pick(rows):
 
 
 def default_demo(demo_id):
+    mode='next_signal' if demo_id>=6 else 'same_signal'
     return {'id':demo_id,'name':f'Demo {demo_id}','balance':DEMO_START,'wins':0,'losses':0,'pending':None,'history':[],
-            'last_round_id':None,'updated_at':None,'running':True,'max_gale':0}
+            'last_round_id':None,'updated_at':None,'running':True,'max_gale':0,'gale_mode':mode}
 
 
 def sanitize_demo(d,demo_id):
@@ -140,35 +141,39 @@ def sanitize_demo(d,demo_id):
     if isinstance(d,dict): base.update(d)
     base['id']=demo_id; base['name']=f'Demo {demo_id}'
     base['max_gale']=max(0,min(5,int(base.get('max_gale',0))))
+    if base.get('gale_mode') not in ('same_signal','next_signal'):
+        base['gale_mode']='next_signal' if demo_id>=6 else 'same_signal'
     if not isinstance(base.get('history'),list): base['history']=[]
     base['history']=base['history'][:200]
     return base
 
 
-def migrate_current_demo():
+def migrate_current_demos():
     try:
         payload=fetch_json(MIGRATE_DEMO_URL,8)
-        old=None
+        arr=[]
         if isinstance(payload,dict):
-            if isinstance(payload.get('demos'),list) and payload['demos']: old=payload['demos'][0]
-            elif isinstance(payload.get('demo'),dict): old=payload['demo']
-        if old:
-            print('[DEMO][MIGRATE] Demo 1 recuperada do deploy anterior',flush=True)
-            return sanitize_demo(old,1)
+            if isinstance(payload.get('demos'),list): arr=payload['demos']
+            elif isinstance(payload.get('demo'),dict): arr=[payload['demo']]
+        if arr:
+            keep=min(len(arr),DEMO_COUNT)
+            print(f'[DEMO][MIGRATE] {keep} demos recuperadas do deploy anterior',flush=True)
+            return [sanitize_demo(arr[i],i+1) for i in range(keep)]
     except Exception as e:
         print('[DEMO][MIGRATE] indisponivel:',repr(e),flush=True)
-    return None
+    return []
 
 
 def load_demos():
     try:
         with open(DEMO_FILE,'r',encoding='utf-8') as f: d=json.load(f)
         arr=d.get('demos') if isinstance(d,dict) else d
-        if isinstance(arr,list) and arr: return [sanitize_demo(arr[i] if i<len(arr) else {},i+1) for i in range(DEMO_COUNT)]
+        if isinstance(arr,list) and arr:
+            return [sanitize_demo(arr[i] if i<len(arr) else {},i+1) for i in range(DEMO_COUNT)]
     except: pass
-    first=migrate_current_demo()
-    out=[first or default_demo(1)]
-    out.extend(default_demo(i) for i in range(2,DEMO_COUNT+1))
+    old=migrate_current_demos()
+    out=list(old)
+    for i in range(len(out)+1,DEMO_COUNT+1): out.append(default_demo(i))
     return out
 
 
@@ -180,26 +185,35 @@ def save_demos_locked():
     os.replace(tmp,DEMO_FILE)
 
 
-def new_signal_pending(demo,round_row,history_at_round):
+def new_signal_pending(demo,round_row,history_at_round,bet=None,gale_level=0):
     sig=calc_pick(history_at_round)
-    if not sig or demo['balance']<DEMO_BET: return None
-    return {'pick':sig['pick'],'confidence':sig['confidence'],'base_round_id':round_row['id'],'bet':DEMO_BET,'gale_level':0}
+    value=DEMO_BET if bet is None else float(bet)
+    if not sig or demo['balance']<value: return None
+    return {'pick':sig['pick'],'confidence':sig['confidence'],'base_round_id':round_row['id'],'bet':value,'gale_level':gale_level}
 
 
 def settle_round_locked(demo,round_row,history_at_round):
     p=demo.get('pending'); next_pending=None
     if p:
         actual=int(round_row['color']); pick=int(p['pick']); bet=float(p.get('bet',DEMO_BET)); gale=int(p.get('gale_level',0)); win=(actual==pick)
-        if win: demo['balance']=round(float(demo['balance'])+bet,2); demo['wins']+=1
-        else: demo['balance']=round(float(demo['balance'])-bet,2); demo['losses']+=1
+        if win:
+            demo['balance']=round(float(demo['balance'])+bet,2); demo['wins']+=1
+        else:
+            demo['balance']=round(float(demo['balance'])-bet,2); demo['losses']+=1
         demo['history'].insert(0,{'result':'WIN' if win else 'LOSS','pick':pick,'actual':actual,'roll':int(round_row['roll']),
-            'round_id':round_row['id'],'created_at':round_row.get('created_at'),'bet':bet,'gale_level':gale,'balance_after':demo['balance']})
+            'round_id':round_row['id'],'created_at':round_row.get('created_at'),'bet':bet,'gale_level':gale,
+            'gale_mode':demo.get('gale_mode','same_signal'),'balance_after':demo['balance']})
         demo['history']=demo['history'][:200]
-        print(f"[DEMO{demo['id']}][{'WIN' if win else 'LOSS'}] G{gale} aposta={pick} valor={bet} saiu={actual} saldo={demo['balance']}",flush=True)
+        print(f"[DEMO{demo['id']}][{'WIN' if win else 'LOSS'}] G{gale} modo={demo.get('gale_mode')} aposta={pick} valor={bet} saiu={actual} saldo={demo['balance']}",flush=True)
         if (not win) and gale<int(demo.get('max_gale',0)):
             next_bet=round(bet*2,2)
-            if demo['balance']>=next_bet: next_pending={'pick':pick,'confidence':p.get('confidence'),'base_round_id':round_row['id'],'bet':next_bet,'gale_level':gale+1}
-    if next_pending is None: next_pending=new_signal_pending(demo,round_row,history_at_round)
+            if demo['balance']>=next_bet:
+                if demo.get('gale_mode')=='next_signal':
+                    next_pending=new_signal_pending(demo,round_row,history_at_round,next_bet,gale+1)
+                else:
+                    next_pending={'pick':pick,'confidence':p.get('confidence'),'base_round_id':round_row['id'],'bet':next_bet,'gale_level':gale+1}
+    if next_pending is None:
+        next_pending=new_signal_pending(demo,round_row,history_at_round)
     demo['pending']=next_pending; demo['last_round_id']=round_row['id']
 
 
@@ -242,7 +256,8 @@ def live_worker():
 
 
 def demo_snapshot_one(demo):
-    d=json.loads(json.dumps(demo)); d['start_balance']=DEMO_START; d['base_bet']=DEMO_BET; d['profit']=round(float(d['balance'])-DEMO_START,2); d['gale_options']=[0,1,2,3,4,5]; return d
+    d=json.loads(json.dumps(demo)); d['start_balance']=DEMO_START; d['base_bet']=DEMO_BET; d['profit']=round(float(d['balance'])-DEMO_START,2)
+    d['gale_options']=[0,1,2,3,4,5]; d['gale_modes']=['same_signal','next_signal']; return d
 
 
 def demo_snapshot(demo_id=None):
@@ -259,15 +274,20 @@ def live_snapshot():
 def reset_demo(demo_id=1):
     with LIVE_LOCK: rows=json.loads(json.dumps(LIVE_ROWS))
     with DEMO_LOCK:
-        i=max(1,min(DEMO_COUNT,int(demo_id)))-1; keep_gale=int(DEMOS_STATE[i].get('max_gale',0)); DEMOS_STATE[i]=default_demo(i+1); DEMOS_STATE[i]['max_gale']=keep_gale
+        i=max(1,min(DEMO_COUNT,int(demo_id)))-1
+        keep_gale=int(DEMOS_STATE[i].get('max_gale',0)); keep_mode=DEMOS_STATE[i].get('gale_mode','same_signal')
+        DEMOS_STATE[i]=default_demo(i+1); DEMOS_STATE[i]['max_gale']=keep_gale; DEMOS_STATE[i]['gale_mode']=keep_mode
         if rows:
             DEMOS_STATE[i]['last_round_id']=rows[0]['id']; DEMOS_STATE[i]['pending']=new_signal_pending(DEMOS_STATE[i],rows[0],rows)
         save_demos_locked(); return demo_snapshot_one(DEMOS_STATE[i])
 
 
-def set_demo_config(demo_id,max_gale):
+def set_demo_config(demo_id,max_gale=None,gale_mode=None):
     with DEMO_LOCK:
-        i=max(1,min(DEMO_COUNT,int(demo_id)))-1; DEMOS_STATE[i]['max_gale']=max(0,min(5,int(max_gale))); save_demos_locked(); return demo_snapshot_one(DEMOS_STATE[i])
+        i=max(1,min(DEMO_COUNT,int(demo_id)))-1
+        if max_gale is not None: DEMOS_STATE[i]['max_gale']=max(0,min(5,int(max_gale)))
+        if gale_mode in ('same_signal','next_signal'): DEMOS_STATE[i]['gale_mode']=gale_mode
+        save_demos_locked(); return demo_snapshot_one(DEMOS_STATE[i])
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -289,7 +309,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path.startswith('/api/demo/config'):
             try:
-                body=self._json_body(); self._send(200,json.dumps({'ok':True,'demo':set_demo_config(body.get('demo_id',1),body.get('max_gale',0))},ensure_ascii=False))
+                body=self._json_body(); self._send(200,json.dumps({'ok':True,'demo':set_demo_config(body.get('demo_id',1),body.get('max_gale'),body.get('gale_mode'))},ensure_ascii=False))
             except Exception as e: self._send(400,json.dumps({'ok':False,'error':str(e)},ensure_ascii=False))
             return
         self._send(404,'not found','text/plain; charset=utf-8')
