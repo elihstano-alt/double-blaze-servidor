@@ -17,6 +17,12 @@ DEMO_BET=10.0
 DEMO_FILE='/tmp/double_live_demo_state.json'
 DEMO_LOCK=threading.RLock()
 DEMO_STATE=None
+LIVE_LOCK=threading.RLock()
+LIVE_ROWS=[]
+LIVE_SOURCE=None
+LIVE_UPDATED_AT=None
+LIVE_ERROR=None
+
 
 def color_from_roll(n):
     try: n=int(n)
@@ -25,6 +31,7 @@ def color_from_roll(n):
     if 1<=n<=7: return 1
     if 8<=n<=14: return 2
     return -1
+
 
 def pick_list(obj):
     if isinstance(obj,list): return obj
@@ -37,6 +44,7 @@ def pick_list(obj):
                 if z: return z
     return []
 
+
 def parse_dt(v):
     if not v: return None
     s=str(v).strip()
@@ -44,6 +52,7 @@ def parse_dt(v):
         try: return datetime.strptime(s[:19],fmt)
         except: pass
     return None
+
 
 def normalize(obj):
     data=pick_list(obj)
@@ -75,44 +84,46 @@ def normalize(obj):
     for x in out: x.pop('_dt',None)
     return out
 
+
 def fetch_json(url,timeout=5):
     req=Request(url,headers={'User-Agent':'Mozilla/5.0','Accept':'application/json,text/plain,*/*','Cache-Control':'no-cache'})
     with urlopen(req,timeout=timeout,context=CTX) as r:
         raw=r.read().decode('utf-8','replace')
     return json.loads(raw)
 
+
 def fetch_live():
     errors=[]
     try:
-        payload=fetch_json(OLD_HISTORY,4)
-        rows=normalize(payload)
-        return rows[:50],OLD_HISTORY
+        payload=fetch_json(OLD_HISTORY,2)
+        return normalize(payload)[:50],OLD_HISTORY
     except Exception as e:
         errors.append('Railway antigo => '+type(e).__name__+': '+str(e))
     for u in DIRECT:
         try:
-            rows=normalize(fetch_json(u,4))
-            return rows[:50],u
+            return normalize(fetch_json(u,2))[:50],u
         except Exception as e:
             errors.append(u+' => '+type(e).__name__+': '+str(e))
     raise RuntimeError(' | '.join(errors))
+
 
 def fetch_history_pages(max_pages=6):
     all_rows=[]; seen=set(); pages_ok=0
     for p in range(1,max_pages+1):
         try:
-            rows=normalize(fetch_json(BLAZE_BASE.format(p),4))
+            rows=normalize(fetch_json(BLAZE_BASE.format(p),3))
             pages_ok+=1
             for r in rows:
                 if r['id'] not in seen:
                     seen.add(r['id']); all_rows.append(r)
-        except Exception as e:
+        except Exception:
             if p==1: raise
             break
-    def key(r): return parse_dt(r.get('created_at')) or datetime.min
-    if any(parse_dt(r.get('created_at')) for r in all_rows): all_rows.sort(key=key,reverse=True)
+    if any(parse_dt(r.get('created_at')) for r in all_rows):
+        all_rows.sort(key=lambda r:parse_dt(r.get('created_at')) or datetime.min,reverse=True)
     print(f'[DEMO][HISTORY] paginas={pages_ok} rodadas={len(all_rows)}',flush=True)
     return all_rows
+
 
 def calc_pick(rows):
     a=rows[:30]; t=len(a)
@@ -130,22 +141,25 @@ def calc_pick(rows):
     conf=max(51,min(78,round(50+abs(s1-s2)*52+min(samples,8))))
     return {'pick':pick,'confidence':conf}
 
+
 def default_demo():
     return {'balance':DEMO_START,'wins':0,'losses':0,'pending':None,'history':[],'last_round_id':None,'updated_at':None,'running':True}
 
+
 def load_demo():
     try:
-        with open(DEMO_FILE,'r',encoding='utf-8') as f:
-            d=json.load(f)
+        with open(DEMO_FILE,'r',encoding='utf-8') as f: d=json.load(f)
         if not isinstance(d,dict): raise ValueError()
         base=default_demo(); base.update(d); return base
     except: return default_demo()
+
 
 def save_demo_locked():
     DEMO_STATE['updated_at']=datetime.utcnow().isoformat()+'Z'
     tmp=DEMO_FILE+'.tmp'
     with open(tmp,'w',encoding='utf-8') as f: json.dump(DEMO_STATE,f,ensure_ascii=False)
     os.replace(tmp,DEMO_FILE)
+
 
 def settle_round_locked(round_row,history_at_round):
     p=DEMO_STATE.get('pending')
@@ -157,64 +171,71 @@ def settle_round_locked(round_row,history_at_round):
             DEMO_STATE['balance']=round(float(DEMO_STATE['balance'])-DEMO_BET,2); DEMO_STATE['losses']+=1
         DEMO_STATE['history'].insert(0,{
             'result':'WIN' if win else 'LOSS','pick':int(p['pick']),'actual':actual,'roll':int(round_row['roll']),
-            'round_id':round_row['id'],'created_at':round_row.get('created_at'),'bet':DEMO_BET,
-            'balance_after':DEMO_STATE['balance']
+            'round_id':round_row['id'],'created_at':round_row.get('created_at'),'bet':DEMO_BET,'balance_after':DEMO_STATE['balance']
         })
         DEMO_STATE['history']=DEMO_STATE['history'][:200]
         print(f"[DEMO][{'WIN' if win else 'LOSS'}] aposta={p['pick']} saiu={actual} roll={round_row['roll']} saldo={DEMO_STATE['balance']}",flush=True)
     sig=calc_pick(history_at_round)
-    if sig and DEMO_STATE['balance']>=DEMO_BET:
-        DEMO_STATE['pending']={'pick':sig['pick'],'confidence':sig['confidence'],'base_round_id':round_row['id'],'bet':DEMO_BET}
-    else: DEMO_STATE['pending']=None
+    DEMO_STATE['pending']={'pick':sig['pick'],'confidence':sig['confidence'],'base_round_id':round_row['id'],'bet':DEMO_BET} if sig and DEMO_STATE['balance']>=DEMO_BET else None
     DEMO_STATE['last_round_id']=round_row['id']
     save_demo_locked()
 
-def process_demo_once():
-    rows=fetch_history_pages(6)
+
+def process_demo_rows(rows):
     if not rows: return
     with DEMO_LOCK:
         last=DEMO_STATE.get('last_round_id')
         if not last:
             DEMO_STATE['last_round_id']=rows[0]['id']
             sig=calc_pick(rows)
-            if sig:
-                DEMO_STATE['pending']={'pick':sig['pick'],'confidence':sig['confidence'],'base_round_id':rows[0]['id'],'bet':DEMO_BET}
-            save_demo_locked()
-            print(f"[DEMO][INIT] saldo={DEMO_STATE['balance']} rodada={rows[0]['id']} pending={DEMO_STATE.get('pending')}",flush=True)
-            return
+            if sig: DEMO_STATE['pending']={'pick':sig['pick'],'confidence':sig['confidence'],'base_round_id':rows[0]['id'],'bet':DEMO_BET}
+            save_demo_locked(); return
         idx=next((i for i,r in enumerate(rows) if r['id']==last),None)
         if idx is None:
-            # O histórico disponível não alcançou a última rodada conhecida; não inventa resultados.
             DEMO_STATE['last_round_id']=rows[0]['id']
             sig=calc_pick(rows)
             DEMO_STATE['pending']={'pick':sig['pick'],'confidence':sig['confidence'],'base_round_id':rows[0]['id'],'bet':DEMO_BET} if sig else None
-            save_demo_locked()
-            print('[DEMO][RESYNC] ultima rodada antiga fora da janela; retomando sem liquidar lacuna',flush=True)
-            return
+            save_demo_locked(); return
         if idx==0: return
-        # unseen = rows[0:idx], processa do mais antigo para o mais novo
-        for i in range(idx-1,-1,-1):
-            round_row=rows[i]
-            history_at_round=rows[i:]
-            settle_round_locked(round_row,history_at_round)
+        for i in range(idx-1,-1,-1): settle_round_locked(rows[i],rows[i:])
 
-def demo_worker():
+
+def live_worker():
+    global LIVE_ROWS,LIVE_SOURCE,LIVE_UPDATED_AT,LIVE_ERROR
+    first=True
     while True:
-        try: process_demo_once()
-        except Exception as e: print('[DEMO][ERROR]',repr(e),flush=True)
-        time.sleep(2.0)
+        started=time.time()
+        try:
+            if first:
+                try: rows=fetch_history_pages(6); src='history-pages'
+                except: rows,src=fetch_live()
+                first=False
+            else:
+                rows,src=fetch_live()
+            with LIVE_LOCK:
+                LIVE_ROWS=rows[:50]; LIVE_SOURCE=src; LIVE_UPDATED_AT=datetime.utcnow().isoformat()+'Z'; LIVE_ERROR=None
+            process_demo_rows(rows)
+        except Exception as e:
+            with LIVE_LOCK: LIVE_ERROR=str(e)
+            print('[LIVE][ERROR]',repr(e),flush=True)
+        elapsed=time.time()-started
+        time.sleep(max(0.0,0.2-elapsed))
+
 
 def demo_snapshot():
-    with DEMO_LOCK:
-        d=json.loads(json.dumps(DEMO_STATE))
+    with DEMO_LOCK: d=json.loads(json.dumps(DEMO_STATE))
     d['start_balance']=DEMO_START; d['bet']=DEMO_BET; d['profit']=round(float(d['balance'])-DEMO_START,2)
     return d
 
+
+def live_snapshot():
+    with LIVE_LOCK:
+        return json.loads(json.dumps({'rows':LIVE_ROWS,'source':LIVE_SOURCE,'updated_at':LIVE_UPDATED_AT,'error':LIVE_ERROR}))
+
+
 def reset_demo():
     global DEMO_STATE
-    rows=[]
-    try: rows=fetch_history_pages(2)
-    except: pass
+    with LIVE_LOCK: rows=json.loads(json.dumps(LIVE_ROWS))
     with DEMO_LOCK:
         DEMO_STATE=default_demo()
         if rows:
@@ -223,6 +244,7 @@ def reset_demo():
             if sig: DEMO_STATE['pending']={'pick':sig['pick'],'confidence':sig['confidence'],'base_round_id':rows[0]['id'],'bet':DEMO_BET}
         save_demo_locked()
         return demo_snapshot()
+
 
 class Handler(BaseHTTPRequestHandler):
     def _send(self,code,body,ctype='application/json; charset=utf-8'):
@@ -240,27 +262,25 @@ class Handler(BaseHTTPRequestHandler):
         self._send(404,'not found','text/plain; charset=utf-8')
     def do_GET(self):
         if self.path.startswith('/health'):
-            self._send(200,json.dumps({'ok':True,'demo_running':True})); return
+            snap=live_snapshot(); self._send(200,json.dumps({'ok':True,'demo_running':True,'live_updated_at':snap['updated_at'],'live_error':snap['error']})); return
         if self.path.startswith('/api/demo'):
             self._send(200,json.dumps({'ok':True,'demo':demo_snapshot()},ensure_ascii=False)); return
         if self.path.startswith('/api/double'):
-            t=time.time()
-            try:
-                rows,src=fetch_live(); self._send(200,json.dumps({'ok':True,'source':src,'latency_ms':int((time.time()-t)*1000),'results':rows},ensure_ascii=False))
-            except Exception as e:
-                print('[DOUBLE][SOURCE_ERROR]',repr(e),flush=True); self._send(502,json.dumps({'ok':False,'error':str(e)},ensure_ascii=False))
+            snap=live_snapshot()
+            if snap['rows']:
+                self._send(200,json.dumps({'ok':True,'source':snap['source'],'updated_at':snap['updated_at'],'results':snap['rows']},ensure_ascii=False))
+            else:
+                self._send(503,json.dumps({'ok':False,'error':snap['error'] or 'aguardando primeira leitura'},ensure_ascii=False))
             return
         p=self.path.split('?',1)[0]; path='index.html' if p in ('/','') else p.lstrip('/'); full=os.path.join(ROOT,path)
         if not os.path.isfile(full): self._send(404,'not found','text/plain; charset=utf-8'); return
         ext=os.path.splitext(full)[1].lower(); ct={'.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8','.js':'application/javascript; charset=utf-8'}.get(ext,'application/octet-stream')
         with open(full,'rb') as f: self._send(200,f.read(),ct)
-    def log_message(self,fmt,*args): print('[DOUBLE]',fmt%args,flush=True)
+    def log_message(self,fmt,*args): pass
+
 
 if __name__=='__main__':
     DEMO_STATE=load_demo()
     print(f'Double Live em http://localhost:{PORT}',flush=True)
-    try:
-        rows,src=fetch_live(); print(f'[DOUBLE][STARTUP_OK] {len(rows)} rodadas recebidas via {src}',flush=True)
-    except Exception as e: print('[DOUBLE][STARTUP_FAIL]',repr(e),flush=True)
-    threading.Thread(target=demo_worker,name='demo-worker',daemon=True).start()
+    threading.Thread(target=live_worker,name='live-worker',daemon=True).start()
     ThreadingHTTPServer((HOST,PORT),Handler).serve_forever()
