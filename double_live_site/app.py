@@ -1,5 +1,6 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.request import Request, urlopen
+from datetime import datetime
 import json, os, time, ssl
 
 HOST='0.0.0.0'
@@ -7,7 +8,7 @@ PORT=int(os.environ.get('PORT','8000'))
 ROOT=os.path.dirname(os.path.abspath(__file__))
 CTX=ssl.create_default_context()
 
-OLD_HISTORY='https://web-production-25658.up.railway.app/api/historico?limit=100'
+OLD_HISTORY='https://web-production-25658.up.railway.app/historico?limite=100'
 DIRECT=[
  'https://blaze.bet.br/api/singleplayer-originals/originals/roulette_games/recent/1',
  'https://blaze.com/api/singleplayer-originals/originals/roulette_games/recent/1',
@@ -24,13 +25,21 @@ def color_from_roll(n):
 def pick_list(obj):
     if isinstance(obj,list): return obj
     if isinstance(obj,dict):
-        for k in ('historico','history','results','records','data','items','rodadas'):
+        for k in ('rodadas','historico','history','results','records','data','items'):
             v=obj.get(k)
             if isinstance(v,list): return v
             if isinstance(v,dict):
                 z=pick_list(v)
                 if z: return z
     return []
+
+def parse_dt(v):
+    if not v: return None
+    s=str(v).strip()
+    for fmt in ('%d/%m/%Y %H:%M:%S','%Y-%m-%dT%H:%M:%S','%Y-%m-%d %H:%M:%S'):
+        try: return datetime.strptime(s[:19],fmt)
+        except: pass
+    return None
 
 def normalize(obj):
     data=pick_list(obj)
@@ -39,7 +48,7 @@ def normalize(obj):
         if isinstance(x,(int,float,str)):
             try: roll=int(x)
             except: continue
-            out.append({'id':str(i)+'-'+str(roll),'roll':roll,'color':color_from_roll(roll),'created_at':None})
+            out.append({'id':str(i)+'-'+str(roll),'roll':roll,'color':color_from_roll(roll),'created_at':None,'_dt':None})
             continue
         if not isinstance(x,dict): continue
         roll=x.get('roll',x.get('number',x.get('numero',x.get('value',x.get('resultado',-1)))))
@@ -52,11 +61,17 @@ def normalize(obj):
             elif s in ('red','vermelho','v','r'): c=1
             elif s in ('black','preto','p','b'): c=2
         if c not in (0,1,2): c=color_from_roll(roll)
-        created=x.get('created_at') or x.get('created_date') or x.get('date') or x.get('data') or x.get('timestamp') or x.get('hora')
+        created=(x.get('created_at') or x.get('created_date') or x.get('data_hora') or
+                 x.get('date') or x.get('data') or x.get('timestamp') or x.get('hora'))
         rid=x.get('id') or x.get('_id') or x.get('game_id') or created or f'{i}-{roll}'
         if 0<=roll<=14 and c in (0,1,2):
-            out.append({'id':str(rid),'roll':roll,'color':c,'created_at':created})
+            out.append({'id':str(rid),'roll':roll,'color':c,'created_at':created,'_dt':parse_dt(created)})
     if not out: raise RuntimeError('fonte respondeu sem rodadas reconheciveis')
+    if any(x.get('_dt') for x in out):
+        out.sort(key=lambda x: x.get('_dt') or datetime.min, reverse=True)
+    else:
+        out.reverse()
+    for x in out: x.pop('_dt',None)
     return out
 
 def fetch_json(url,timeout=5):
@@ -68,7 +83,9 @@ def fetch_json(url,timeout=5):
 def fetch_live():
     errors=[]
     try:
-        rows=normalize(fetch_json(OLD_HISTORY,6))
+        payload=fetch_json(OLD_HISTORY,6)
+        rows=normalize(payload)
+        print(f'[DOUBLE][RAILWAY_OK] quantidade_payload={payload.get("quantidade") if isinstance(payload,dict) else "?"} normalizadas={len(rows)}',flush=True)
         return rows[:50],OLD_HISTORY
     except Exception as e:
         errors.append('Railway antigo => '+type(e).__name__+': '+str(e))
