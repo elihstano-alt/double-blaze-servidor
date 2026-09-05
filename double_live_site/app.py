@@ -133,4 +133,9 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__=='__main__':
     print(f'Double Live em http://localhost:{PORT}',flush=True)
+    try:
+        rows,src=fetch_live()
+        print(f'[DOUBLE][STARTUP_OK] {len(rows)} rodadas recebidas via {src}',flush=True)
+    except Exception as e:
+        print('[DOUBLE][STARTUP_FAIL]',repr(e),flush=True)
     ThreadingHTTPServer((HOST,PORT),Handler).serve_forever()
