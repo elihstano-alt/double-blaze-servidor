@@ -1,20 +1,84 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.request import Request, urlopen
-import json, os, time, ssl
+from html.parser import HTMLParser
+from datetime import datetime
+import json, os, time, ssl, re
 
 HOST='0.0.0.0'
 PORT=int(os.environ.get('PORT','8000'))
 ROOT=os.path.dirname(os.path.abspath(__file__))
+CTX=ssl.create_default_context()
 
-SOURCES=[
-    os.environ.get('BLAZE_URL','').strip(),
+BESTBLAZE='https://bestblaze.com.br/doubleRodadas'
+BLAZE_SOURCES=[
     'https://blaze.bet.br/api/singleplayer-originals/originals/roulette_games/recent/1',
     'https://blaze.com/api/singleplayer-originals/originals/roulette_games/recent/1',
     'https://blaze.com/api/roulette_games/recent',
 ]
-SOURCES=[u for i,u in enumerate(SOURCES) if u and u not in SOURCES[:i]]
 
-CTX=ssl.create_default_context()
+class TextExtractor(HTMLParser):
+    def __init__(self):
+        super().__init__(); self.parts=[]
+    def handle_data(self,data):
+        s=' '.join(data.split())
+        if s: self.parts.append(s)
+
+
+def color_from_roll(roll):
+    if roll==0: return 0
+    if 1 <= roll <= 7: return 1
+    if 8 <= roll <= 14: return 2
+    return -1
+
+
+def fetch_bestblaze():
+    req=Request(BESTBLAZE,headers={
+        'User-Agent':'Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 Chrome/140 Safari/537.36',
+        'Accept':'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language':'pt-BR,pt;q=0.9',
+        'Cache-Control':'no-cache',
+    })
+    with urlopen(req,timeout=6,context=CTX) as r:
+        raw=r.read().decode('utf-8','replace')
+    p=TextExtractor(); p.feed(raw)
+    text='\n'.join(p.parts)
+
+    # Captura pares número + data/hora. Quando o zero é renderizado apenas visualmente,
+    # o número pode não aparecer no texto; nesse caso inferimos 0 para aquele timestamp.
+    dt_pat=re.compile(r'\b(\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2})\b')
+    matches=list(dt_pat.finditer(text))
+    rows=[]
+    last_end=0
+    for m in matches:
+        before=text[last_end:m.start()]
+        nums=re.findall(r'(?<!\d)(1[0-4]|[0-9])(?!\d)', before[-80:])
+        roll=int(nums[-1]) if nums else 0
+        if not (0 <= roll <= 14):
+            last_end=m.end(); continue
+        ds=m.group(1)
+        try:
+            dt=datetime.strptime(ds,'%d/%m/%Y %H:%M:%S')
+        except Exception:
+            last_end=m.end(); continue
+        rows.append({
+            'id': ds,
+            'roll': roll,
+            'color': color_from_roll(roll),
+            'created_at': dt.isoformat(),
+            '_dt': dt,
+        })
+        last_end=m.end()
+
+    # Remove duplicados e ordena do mais novo para o mais antigo.
+    dedup={}
+    for x in rows:
+        dedup[x['id']]=x
+    rows=list(dedup.values())
+    rows.sort(key=lambda x:x['_dt'],reverse=True)
+    for x in rows: x.pop('_dt',None)
+    if len(rows) < 6:
+        raise RuntimeError('BestBlaze respondeu, mas não foi possível extrair rodadas suficientes')
+    return rows[:50], BESTBLAZE
 
 
 def normalize(data):
@@ -24,48 +88,47 @@ def normalize(data):
         raise ValueError('Resposta inesperada da fonte')
     out=[]
     for x in data[:50]:
-        if not isinstance(x, dict):
-            continue
-        roll=x.get('roll', x.get('number', x.get('value', -1)))
+        if not isinstance(x, dict): continue
+        roll=x.get('roll',x.get('number',x.get('value',-1)))
         try: roll=int(roll)
         except: roll=-1
-        color=x.get('color', x.get('color_code'))
+        color=x.get('color',x.get('color_code'))
         if isinstance(color,str):
             c=color.strip().lower()
             if c in ('white','branco','w'): color=0
             elif c in ('red','vermelho','v','r'): color=1
             elif c in ('black','preto','p','b'): color=2
-        out.append({
-            'id': x.get('id') or x.get('_id') or x.get('created_at') or str(time.time()),
-            'roll': roll,
-            'color': color,
-            'created_at': x.get('created_at') or x.get('created_date') or x.get('date')
-        })
-    if not out:
-        raise ValueError('Fonte respondeu sem resultados')
+        if color not in (0,1,2) and 0 <= roll <= 14:
+            color=color_from_roll(roll)
+        out.append({'id':x.get('id') or x.get('_id') or x.get('created_at') or str(time.time()),'roll':roll,'color':color,'created_at':x.get('created_at') or x.get('created_date') or x.get('date')})
+    if not out: raise ValueError('Fonte respondeu sem resultados')
     return out
+
+
+def fetch_blaze_direct():
+    errors=[]
+    for url in BLAZE_SOURCES:
+        try:
+            req=Request(url,headers={'User-Agent':'Mozilla/5.0','Accept':'application/json,text/plain,*/*','Referer':'https://blaze.bet.br/','Origin':'https://blaze.bet.br'})
+            with urlopen(req,timeout=3,context=CTX) as r:
+                raw=r.read().decode('utf-8','replace')
+            return normalize(json.loads(raw)),url
+        except Exception as e:
+            errors.append(f'{url} => {type(e).__name__}: {e}')
+    raise RuntimeError(' | '.join(errors))
 
 
 def fetch_live():
     errors=[]
-    for url in SOURCES:
-        try:
-            req=Request(url,headers={
-                'User-Agent':'Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 Chrome/140 Safari/537.36',
-                'Accept':'application/json,text/plain,*/*',
-                'Accept-Language':'pt-BR,pt;q=0.9,en;q=0.8',
-                'Referer':'https://blaze.bet.br/',
-                'Origin':'https://blaze.bet.br',
-                'Cache-Control':'no-cache',
-            })
-            with urlopen(req,timeout=5,context=CTX) as r:
-                raw=r.read().decode('utf-8','replace')
-                if r.status != 200:
-                    raise RuntimeError(f'HTTP {r.status}')
-            data=json.loads(raw)
-            return normalize(data),url
-        except Exception as e:
-            errors.append(f'{url} => {type(e).__name__}: {e}')
+    # Fonte brasileira primeiro para contornar o bloqueio geográfico/451 da Blaze no Render.
+    try:
+        return fetch_bestblaze()
+    except Exception as e:
+        errors.append(f'BestBlaze => {type(e).__name__}: {e}')
+    try:
+        return fetch_blaze_direct()
+    except Exception as e:
+        errors.append(f'Blaze => {type(e).__name__}: {e}')
     raise RuntimeError(' | '.join(errors))
 
 
@@ -79,6 +142,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Origin','*')
         self.end_headers(); self.wfile.write(data)
 
+    def do_HEAD(self):
+        self.send_response(200); self.end_headers()
+
     def do_GET(self):
         if self.path.startswith('/health'):
             self._send(200,json.dumps({'ok':True,'service':'double-live-radar'})); return
@@ -86,6 +152,7 @@ class Handler(BaseHTTPRequestHandler):
             started=time.time()
             try:
                 out,source=fetch_live()
+                print(f'[DOUBLE][OK] {len(out)} resultados via {source}',flush=True)
                 self._send(200,json.dumps({'ok':True,'source':source,'latency_ms':int((time.time()-started)*1000),'results':out},ensure_ascii=False))
             except Exception as e:
                 print('[DOUBLE][SOURCE_ERROR]',repr(e),flush=True)
